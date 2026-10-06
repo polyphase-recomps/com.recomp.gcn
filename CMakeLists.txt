@@ -1,0 +1,143 @@
+cmake_minimum_required(VERSION 3.15)
+project(com.recomp.gcn)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Polyphase Engine path resolution.
+#
+# Priority order:
+#   1. -DPOLYPHASE_PATH=... or already set in parent script
+#   2. POLYPHASE_PATH environment variable
+#   3. Walk up from this CMakeLists looking for Polyphase.sln
+#      (catches addon-under-engine and sibling-repo layouts)
+#   4. Default install locations (C:/Polyphase, /opt/Polyphase)
+#   5. Engine path captured at generation time (last resort)
+# Walk up from this CMakeLists looking for either:
+#   - PolyphaseConfig.cmake : project-local engine path written
+#                             by the editor on project open. This
+#                             is the canonical answer for addons
+#                             living in <project>/Packages.
+#   - Polyphase.sln         : engine source root, for addons
+#                             checked out under or beside the
+#                             engine repo.
+function(_polyphase_find_via_walk OUT_VAR)
+    set(_p "${CMAKE_CURRENT_SOURCE_DIR}")
+    foreach(_i RANGE 1 6)
+        get_filename_component(_p "${_p}" DIRECTORY)
+        if(EXISTS "${_p}/PolyphaseConfig.cmake")
+            include("${_p}/PolyphaseConfig.cmake")
+            if(DEFINED POLYPHASE_PATH AND NOT POLYPHASE_PATH STREQUAL "")
+                set(${OUT_VAR} "${POLYPHASE_PATH}" PARENT_SCOPE)
+                return()
+            endif()
+        endif()
+        if(EXISTS "${_p}/Polyphase.sln")
+            set(${OUT_VAR} "${_p}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+    set(${OUT_VAR} "" PARENT_SCOPE)
+endfunction()
+
+if(NOT DEFINED POLYPHASE_PATH OR POLYPHASE_PATH STREQUAL "")
+    if(DEFINED ENV{POLYPHASE_PATH} AND NOT "$ENV{POLYPHASE_PATH}" STREQUAL "")
+        set(POLYPHASE_PATH "$ENV{POLYPHASE_PATH}")
+    else()
+        _polyphase_find_via_walk(_walk)
+        if(NOT _walk STREQUAL "")
+            set(POLYPHASE_PATH "${_walk}")
+        elseif(WIN32 AND EXISTS "C:/Polyphase/Polyphase.exe")
+            set(POLYPHASE_PATH "C:/Polyphase")
+        elseif(WIN32 AND EXISTS "C:/Program Files/Polyphase/Polyphase.exe")
+            set(POLYPHASE_PATH "C:/Program Files/Polyphase")
+        elseif(UNIX AND EXISTS "/opt/Polyphase/PolyphaseEditor")
+            set(POLYPHASE_PATH "/opt/Polyphase")
+        else()
+            set(POLYPHASE_PATH "M:/Projects/Polyphase/Polyphase/CODE/mergePolyphase/polyphase-engine/")
+        endif()
+    endif()
+endif()
+message(STATUS "Polyphase: using POLYPHASE_PATH = ${POLYPHASE_PATH}")
+
+# Gather source files
+file(GLOB_RECURSE SOURCES "Source/*.cpp" "Source/*.c")
+file(GLOB_RECURSE HEADERS "Source/*.h" "Source/*.hpp")
+
+# Create shared library
+add_library(com.recomp.gcn SHARED ${SOURCES} ${HEADERS})
+
+# Find Vulkan headers. Engine headers include vulkan/vulkan.h under
+# API_VULKAN, so this is required even if the addon never uses Vulkan.
+set(VULKAN_INCLUDE_DIR "")
+if(DEFINED ENV{VULKAN_SDK})
+    if(EXISTS "$ENV{VULKAN_SDK}/Include/vulkan/vulkan.h")
+        set(VULKAN_INCLUDE_DIR "$ENV{VULKAN_SDK}/Include")
+    elseif(EXISTS "$ENV{VULKAN_SDK}/include/vulkan/vulkan.h")
+        set(VULKAN_INCLUDE_DIR "$ENV{VULKAN_SDK}/include")
+    endif()
+endif()
+if(NOT VULKAN_INCLUDE_DIR AND EXISTS "${POLYPHASE_PATH}/External/Vulkan/include/vulkan/vulkan.h")
+    set(VULKAN_INCLUDE_DIR "${POLYPHASE_PATH}/External/Vulkan/include")
+endif()
+if(NOT VULKAN_INCLUDE_DIR)
+    find_package(Vulkan QUIET)
+    if(Vulkan_FOUND)
+        set(VULKAN_INCLUDE_DIR "${Vulkan_INCLUDE_DIRS}")
+    endif()
+endif()
+if(NOT VULKAN_INCLUDE_DIR)
+    message(FATAL_ERROR "Vulkan headers not found. Install the Vulkan SDK from https://vulkan.lunarg.com/sdk/home and set VULKAN_SDK, or use an engine install that ships External/Vulkan/include.")
+endif()
+message(STATUS "Polyphase: using Vulkan headers from ${VULKAN_INCLUDE_DIR}")
+
+# Include directories
+target_include_directories(com.recomp.gcn PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Source
+    ${POLYPHASE_PATH}/Engine/Source
+    ${POLYPHASE_PATH}/Engine/Source/Engine
+    ${POLYPHASE_PATH}/Engine/Source/Plugins
+    ${POLYPHASE_PATH}/External
+    ${POLYPHASE_PATH}/External/Assimp
+    ${POLYPHASE_PATH}/External/Bullet
+    ${POLYPHASE_PATH}/External/Lua
+    ${POLYPHASE_PATH}/External/glm
+    ${POLYPHASE_PATH}/External/Imgui
+    ${POLYPHASE_PATH}/External/ImGuizmo
+    ${POLYPHASE_PATH}/External/Vorbis
+    "${CMAKE_CURRENT_SOURCE_DIR}/../com.recomp.mod.base/Source"
+)
+
+# Vulkan headers (resolved above)
+target_include_directories(com.recomp.gcn PRIVATE ${VULKAN_INCLUDE_DIR})
+
+# Compile definitions
+target_compile_definitions(com.recomp.gcn PRIVATE
+    OCTAVE_PLUGIN_EXPORT
+    EDITOR=1
+    LUA_ENABLED=1
+    GLM_FORCE_RADIANS
+    PLATFORM_WINDOWS=1
+    API_VULKAN=1
+    NOMINMAX
+    COMRECOMPGCN_EXPORTS
+)
+
+# Link against Polyphase import library and dependencies
+if(WIN32)
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(POLYPHASE_DEV_LIB_PATH "${POLYPHASE_PATH}/Standalone/Build/Windows/x64/DebugEditor")
+        set(POLYPHASE_DEV_LUA_PATH "${POLYPHASE_PATH}/External/Lua/Build/Windows/x64/DebugEditor")
+    else()
+        set(POLYPHASE_DEV_LIB_PATH "${POLYPHASE_PATH}/Standalone/Build/Windows/x64/ReleaseEditor")
+        set(POLYPHASE_DEV_LUA_PATH "${POLYPHASE_PATH}/External/Lua/Build/Windows/x64/ReleaseEditor")
+    endif()
+    target_link_directories(com.recomp.gcn PRIVATE
+        "${POLYPHASE_PATH}"
+        "${POLYPHASE_PATH}/lib"
+        "${POLYPHASE_DEV_LIB_PATH}"
+        "${POLYPHASE_DEV_LUA_PATH}")
+    target_link_libraries(com.recomp.gcn PRIVATE Polyphase Lua)
+    target_link_directories(com.recomp.gcn PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../com.recomp.mod.base/Build")
+    target_link_libraries(com.recomp.gcn PRIVATE com.recomp.mod.base)
+endif()

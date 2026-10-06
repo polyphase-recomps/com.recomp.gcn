@@ -1,0 +1,18 @@
+{
+    "name": "com.recomp.gcn",
+    "author": "",
+    "description": "GameCube recompilation runtime: builds decompiled GameCube games natively (portable C) and plays them with the GcnPlayer node; Lua table Gcn and C mods",
+    "version": "1.0.0",
+    "dependencies": {
+        "com.recomp.mod.base": "https://github.com/polyphase-recomps/com.recomp.mod.base"
+    },
+    "native": {
+        "target": "engine",
+        "sourceDir": "Source",
+        "binaryName": "com.recomp.gcn",
+        "entrySymbol": "PolyphasePlugin_GetDesc",
+        "apiVersion": 3,
+        "resolveMode": "source",
+        "binaries": []
+    }
+}

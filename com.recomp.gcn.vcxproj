@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>16.0</VCProjectVersion>
+    <ProjectGuid>{9C8F4DC7-A9D1-9684-52E5-929D37303B03}</ProjectGuid>
+    <RootNamespace>com.recomp.gcn</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros">
+    <PolyphasePath Condition="'$(PolyphasePath)' == '' and '$(POLYPHASE_PATH)' != ''">$(POLYPHASE_PATH)</PolyphasePath>
+    <PolyphasePath Condition="'$(PolyphasePath)' == '' and '$(PolyphaseDevPath)' != ''">$(PolyphaseDevPath)</PolyphasePath>
+    <PolyphasePath Condition="'$(PolyphasePath)' == '' and Exists('$(ProjectDir)..\Polyphase.sln')">$([System.IO.Path]::GetFullPath('$(ProjectDir)..'))</PolyphasePath>
+    <PolyphasePath Condition="'$(PolyphasePath)' == '' and Exists('$(ProjectDir)..\..\Polyphase.sln')">$([System.IO.Path]::GetFullPath('$(ProjectDir)..\..'))</PolyphasePath>
+    <PolyphasePath Condition="'$(PolyphasePath)' == '' and Exists('$(ProjectDir)..\..\..\Polyphase.sln')">$([System.IO.Path]::GetFullPath('$(ProjectDir)..\..\..'))</PolyphasePath>
+    <PolyphasePath Condition="'$(PolyphasePath)' == '' and Exists('$(ProjectDir)..\..\..\..\Polyphase.sln')">$([System.IO.Path]::GetFullPath('$(ProjectDir)..\..\..\..'))</PolyphasePath>
+    <PolyphasePath Condition="'$(PolyphasePath)' == '' and Exists('C:\Polyphase\Polyphase.exe')">C:\Polyphase</PolyphasePath>
+    <PolyphasePath Condition="'$(PolyphasePath)' == '' and Exists('C:\Program Files\Polyphase\Polyphase.exe')">C:\Program Files\Polyphase</PolyphasePath>
+    <PolyphasePath Condition="'$(PolyphasePath)' == '' and Exists('C:\Program Files (x86)\Polyphase\Polyphase.exe')">C:\Program Files (x86)\Polyphase</PolyphasePath>
+    <PolyphasePath Condition="'$(PolyphasePath)' == ''">M:\Projects\Polyphase\Polyphase\CODE\mergePolyphase\polyphase-engine\</PolyphasePath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <OutDir>$(ProjectDir)Build\Debug\</OutDir>
+    <IntDir>$(ProjectDir)Build\Intermediate\Debug\</IntDir>
+    <TargetName>com.recomp.gcn</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <OutDir>$(ProjectDir)Build\Release\</OutDir>
+    <IntDir>$(ProjectDir)Build\Intermediate\Release\</IntDir>
+    <TargetName>com.recomp.gcn</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>OCTAVE_PLUGIN_EXPORT;EDITOR=1;LUA_ENABLED=1;GLM_FORCE_RADIANS;PLATFORM_WINDOWS=1;API_VULKAN=1;NOMINMAX;COMRECOMPGCN_EXPORTS;_DEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalIncludeDirectories>$(PolyphasePath)\Engine\Source;$(PolyphasePath)\Engine\Source\Engine;$(PolyphasePath)\Engine\Source\Plugins;$(PolyphasePath)\External;$(PolyphasePath)\External\Assimp;$(PolyphasePath)\External\Bullet;$(PolyphasePath)\External\Lua;$(PolyphasePath)\External\glm;$(PolyphasePath)\External\Imgui;$(PolyphasePath)\External\ImGuizmo;$(PolyphasePath)\External\Vorbis;$(ProjectDir)..\com.recomp.mod.base\Source;C:\VulkanSDK\1.3.275.0\Include;$(VULKAN_SDK)\Include;$(ProjectDir)Source;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>$(PolyphasePath)\;$(PolyphasePath)\lib\;$(PolyphasePath)\Standalone\Build\Windows\x64\DebugEditor\;$(PolyphasePath)\External\Lua\Build\Windows\x64\DebugEditor\;$(ProjectDir)..\com.recomp.mod.base\Build\Debug;$(ProjectDir)..\com.recomp.mod.base\Build\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>Polyphase.lib;Lua.lib;com.recomp.mod.base.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>OCTAVE_PLUGIN_EXPORT;EDITOR=1;LUA_ENABLED=1;GLM_FORCE_RADIANS;PLATFORM_WINDOWS=1;API_VULKAN=1;NOMINMAX;COMRECOMPGCN_EXPORTS;NDEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalIncludeDirectories>$(PolyphasePath)\Engine\Source;$(PolyphasePath)\Engine\Source\Engine;$(PolyphasePath)\Engine\Source\Plugins;$(PolyphasePath)\External;$(PolyphasePath)\External\Assimp;$(PolyphasePath)\External\Bullet;$(PolyphasePath)\External\Lua;$(PolyphasePath)\External\glm;$(PolyphasePath)\External\Imgui;$(PolyphasePath)\External\ImGuizmo;$(PolyphasePath)\External\Vorbis;$(ProjectDir)..\com.recomp.mod.base\Source;C:\VulkanSDK\1.3.275.0\Include;$(VULKAN_SDK)\Include;$(ProjectDir)Source;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>$(PolyphasePath)\;$(PolyphasePath)\lib\;$(PolyphasePath)\Standalone\Build\Windows\x64\ReleaseEditor\;$(PolyphasePath)\External\Lua\Build\Windows\x64\ReleaseEditor\;$(ProjectDir)..\com.recomp.mod.base\Build\Debug;$(ProjectDir)..\com.recomp.mod.base\Build\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>Polyphase.lib;Lua.lib;com.recomp.mod.base.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="Source\ComRecompGcn.cpp" />
+    <ClInclude Include="Source\Gcn\gcnw.h" />
+    <ClCompile Include="Source\Gcn\gcnw_backend.c" />
+    <ClInclude Include="Source\Gcn\gcnw_backend.h" />
+    <ClInclude Include="Source\Gcn\gcnw_config.h" />
+    <ClInclude Include="Source\Gcn\gcnw_mem_ops.h" />
+    <ClInclude Include="Source\Gcn\gcnw_module.h" />
+    <ClInclude Include="Source\Gcn\gcnw_ops.h" />
+    <ClCompile Include="Source\Gcn\gcnw_rt.c" />
+    <ClCompile Include="Source\Gcn\gcn_disc.c" />
+    <ClInclude Include="Source\Gcn\gcn_disc.h" />
+    <ClCompile Include="Source\Gcn\gcn_gpu.c" />
+    <ClInclude Include="Source\Gcn\gcn_gpu.h" />
+    <ClCompile Include="Source\Gcn\gcn_overlay.c" />
+    <ClInclude Include="Source\Gcn\gcn_overlay.h" />
+    <ClInclude Include="Source\Gcn\gcn_platform.h" />
+    <ClCompile Include="Source\Gcn\gcn_raster.c" />
+    <ClInclude Include="Source\Gcn\gcn_raster.h" />
+    <ClCompile Include="Source\Gcn\gcn_thp.c" />
+    <ClInclude Include="Source\Gcn\gcn_thp.h" />
+    <ClInclude Include="Source\Gcn\wasm-rt-exceptions.h" />
+    <ClInclude Include="Source\Gcn\wasm-rt.h" />
+    <ClCompile Include="Source\GcnDependencies.cpp" />
+    <ClInclude Include="Source\GcnDependencies.h" />
+    <ClCompile Include="Source\GcnGuestHost.cpp" />
+    <ClInclude Include="Source\GcnGuestHost.h" />
+    <ClCompile Include="Source\GcnLua.cpp" />
+    <ClInclude Include="Source\GcnLua.h" />
+    <ClCompile Include="Source\GcnPlayer.cpp" />
+    <ClInclude Include="Source\GcnPlayer.h" />
+    <ClCompile Include="Source\GcnProvider.cpp" />
+    <ClInclude Include="Source\GcnProvider.h" />
+    <ClInclude Include="Source\Guest\sfa\sfa_guest-impl.h" />
+    <ClInclude Include="Source\Guest\sfa\sfa_guest.h" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_0.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_1.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_10.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_11.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_12.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_13.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_14.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_15.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_2.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_3.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_4.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_5.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_6.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_7.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_8.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_9.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_module.c" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_register.cpp" />
+    <ClCompile Include="Source\Guest\sfa\sfa_guest_syms.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(ProjectDir)..\com.recomp.mod.base\com.recomp.mod.base.vcxproj">
+      <Project>{F04A2B64-C81A-5453-EC33-2AA57E13E67B}</Project>
+    </ProjectReference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>
