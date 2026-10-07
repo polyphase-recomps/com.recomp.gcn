@@ -79,6 +79,11 @@ static bool OnPreBuild(int32_t platform, void* userData)
             return true;
         }
         sHooks->GetBuildSetting(GcnDependencies::kDecompOption, decomp, sizeof(decomp));
+        char mode[16] = "";
+        if (sHooks->GetBuildSetting(GcnDependencies::kModeOption, mode, sizeof(mode)))
+        {
+            GcnDependencies::SetBuildMode(mode);
+        }
     }
     if (!GcnDependencies::SetupAll(decomp))
     {

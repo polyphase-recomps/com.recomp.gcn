@@ -66,6 +66,11 @@ game's decomp checkout and your disc image. Then either
 The translated game is portable C, so one build serves every platform the project is
 packaged for. Add a `GcnPlayer` node to a scene and set **Game** to the game package id.
 
+**Recomp mode** (Windows x64): a game package with a `Recomp/` folder can instead run
+recompiled from the machine code on your own disc (Build mode **Recomp** in the GCN Recomp
+Target Options, or `Runtime/tools/recomp/build_recomp.ps1`). Its disc is unpacked into the
+project's `Assets/Recomp/<name>/Disc`. See [Docs/Recomp.md](Docs/Recomp.md).
+
 ### Controls (default)
 
 Keyboard: arrows = stick, X = A, Z = B, S = X, A = Y, Q = L, W = R, E = Z, I J K L = C-stick,

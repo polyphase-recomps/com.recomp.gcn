@@ -10,6 +10,12 @@
  * platform the project is packaged for. The same build unpacks the user's disc into the
  * game package (Assets/Disc), where the player reads it and packaging picks it up.
  *
+ * Recomp mode (Build mode "recomp", packages with a Recomp/ folder, Windows): instead,
+ * com.recomp.gcn/Runtime/tools/recomp/build_recomp.ps1 recompiles the disc's own code into a
+ * library in com.recomp.gcn/Lib, registered by Source/Guest/<name>_recomp, and unpacks the disc
+ * into the PROJECT (Assets/Recomp/<name>/Disc): what the game reads at run time stays out of the
+ * packages. The two builds of a game replace each other.
+ *
  * Tools > Recomp > GameCube > Pre Process Rom is the window for that: pick your disc image
  * and the decomp (saved to the game package's Native/local.json, not in git), check
  * them, run it, see its output.
@@ -19,6 +25,7 @@
 
 #if EDITOR && (PLATFORM_WINDOWS || PLATFORM_LINUX)
 
+#include "AssetManager.h"
 #include "Engine.h"
 #include "Log.h"
 #include "Plugins/EditorUIHooks.h"
@@ -37,6 +44,7 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -63,6 +71,9 @@ namespace
 struct GamePackage
 {
     std::string id;
+    std::string packageDir; // .../Packages/<id>/ (forward slashes, trailing)
+    bool hasDecomp = false; // Native/gcn_game.json + build script
+    bool hasRecomp = false; // Recomp/game.json
     std::string nativeDir; // .../Packages/<id>/Native/ (forward slashes, trailing)
     std::string name;      // gcn_game.json "name"
     std::string title;     // gcn_game.json "title"
@@ -78,6 +89,7 @@ struct GameStatus
     bool loaded;     // ... and this addon build contains it
     bool unpacked;   // Assets/Disc/disc.idx exists
     std::string unpackedId; // the game id written in it
+    bool recomp = false;    // built (or to be built) as the recomp build
 };
 
 std::mutex sLock;
@@ -95,6 +107,7 @@ std::chrono::steady_clock::time_point sRunStart;
 HANDLE sJob = nullptr;             // the running build and everything it starts
 #endif
 
+std::string sMode = "auto";      // kModeOption, set by the Target Options / before packaging
 std::vector<GameStatus> sStatus; // Target Options panel, refreshed on demand
 bool sStatusValid = false;
 int sStatusGeneration = 0;       // bumped when a run ends
@@ -350,13 +363,22 @@ std::vector<GamePackage> FindGamePackages()
     {
         const std::string native = packages + id + "/Native/";
         const std::string config = ReadText(native + "gcn_game.json");
-        if (config.empty()) continue;
+        const std::string recomp = ReadText(packages + id + "/Recomp/game.json");
+        if (config.empty() && recomp.empty()) continue;
         GamePackage game;
         game.id = id;
+        game.packageDir = packages + id + "/";
         game.nativeDir = native;
-        game.name = JsonString(config, "name");
-        game.title = JsonString(config, "title");
-        game.version = JsonString(config, "version");
+        game.hasRecomp = !recomp.empty();
+#if PLATFORM_WINDOWS
+        game.hasDecomp = !config.empty() && Exists(native + "build.ps1");
+#else
+        game.hasDecomp = !config.empty() && Exists(native + "build.sh");
+#endif
+        const std::string& info = config.empty() ? recomp : config;
+        game.name = JsonString(info, "name");
+        game.title = JsonString(info, "title");
+        game.version = JsonString(info, "version");
         if (game.title.empty()) game.title = id;
         // the paths the build uses: Native/local.json, else gcn_game.json (relative to
         // Native/; the disc there is relative to the decomp)
@@ -384,8 +406,20 @@ std::string AddonDir()
     return ProjectDir() + "Packages/com.recomp.gcn/";
 }
 
+// whether this game is built (or to be built) as the recomp build
+bool UseRecomp(const GamePackage& game)
+{
+    if (!game.hasRecomp) return false;
+    if (!game.hasDecomp || sMode == "recomp") return true;
+    if (sMode == "decomp") return false;
+    return Exists(AddonDir() + "Source/Guest/" + game.name + "_recomp/mode.txt"); // auto: as last built
+}
+
+// where the build unpacks the disc: the project for the recomp build (Assets/Recomp/<name>/Disc),
+// the package for the decomp build
 std::string DiscDir(const GamePackage& game)
 {
+    if (UseRecomp(game)) return ProjectDir() + "Assets/Recomp/" + game.name + "/Disc/";
     return ProjectDir() + "Packages/" + game.id + "/Assets/Disc/";
 }
 
@@ -393,7 +427,10 @@ GameStatus GetGameStatus(const GamePackage& game)
 {
     GameStatus s;
     s.id = game.id;
-    s.translated = Exists(AddonDir() + "Source/Guest/" + game.name + "/" + game.name + "_guest_module.c");
+    s.recomp = UseRecomp(game);
+    s.translated = s.recomp ? Exists(AddonDir() + "Source/Guest/" + game.name + "_recomp/" + game.name +
+                                     "_recomp_guest_register.cpp")
+                            : Exists(AddonDir() + "Source/Guest/" + game.name + "/" + game.name + "_guest_module.c");
     s.loaded = gcnw_find_module(game.id.c_str()) != nullptr;
     const std::string idx = ReadText(DiscDir(game) + "disc.idx");
     s.unpacked = !idx.empty();
@@ -427,10 +464,48 @@ bool WriteLocal(const GamePackage& game, const std::string& decomp, const std::s
 }
 
 // decomp / disc: "" = what the game package's local.json or gcn_game.json says
+// recomp mode: build_recomp.ps1 (Windows x64 only)
+bool SetupRecomp(const GamePackage& game, const std::string& decomp, const std::string& disc, bool background)
+{
+#if PLATFORM_WINDOWS
+    const std::string script = AddonDir() + "Runtime/tools/recomp/build_recomp.ps1";
+    if (!Exists(script))
+    {
+        Emit("[gcn] " + game.id + ": com.recomp.gcn has no recomp mode (Runtime/tools/recomp/build_recomp.ps1)", background);
+        return false;
+    }
+    std::string args = "-Package \"" + game.packageDir + "\"";
+    if (!decomp.empty()) args += " -Decomp \"" + decomp + "\"";
+    if (!disc.empty()) args += " -Disc \"" + disc + "\"";
+#if defined(_DEBUG)
+    args += " -DebugCrt"; // the library's C runtime matches this Debug editor
+#endif
+    Emit("[gcn] " + game.id + ": recomp build: build_recomp.ps1 " + args, background);
+    const bool ok = RunCommand("powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" + script + "\" " + args,
+                               game.packageDir, background);
+    if (sCancel)
+    {
+        Emit("[gcn] " + game.id + ": cancelled", background);
+        return false;
+    }
+    Emit("[gcn] " + game.id + (ok ? ": recompiled into com.recomp.gcn" : ": RECOMP BUILD FAILED"), background);
+    return ok;
+#else
+    (void)decomp;
+    (void)disc;
+    Emit("[gcn] " + game.id + ": the recomp build is Windows only for now: use Build mode Decomp", background);
+    return false;
+#endif
+}
+
 bool SetupGame(const GamePackage& game, const std::string& decompIn, const std::string& discIn, bool restoreDisc,
                bool background)
 {
     const std::string decomp = Slashes(decompIn), disc = Slashes(discIn);
+    if (UseRecomp(game))
+    {
+        return SetupRecomp(game, decomp, disc, background);
+    }
     bool ok;
 #if PLATFORM_WINDOWS
     if (!Exists(game.nativeDir + "build.ps1"))
@@ -464,6 +539,17 @@ bool SetupGame(const GamePackage& game, const std::string& decompIn, const std::
         return false;
     }
     Emit("[gcn] " + game.id + (ok ? ": built into com.recomp.gcn" : ": SETUP FAILED"), background);
+    if (ok)
+    {
+        // the decomp build replaces a recomp build of the same game (one at a time)
+        std::error_code ec;
+        const std::filesystem::path recomp(AddonDir() + "Source/Guest/" + game.name + "_recomp");
+        if (std::filesystem::exists(recomp, ec))
+        {
+            std::filesystem::remove_all(recomp, ec);
+            Emit("[gcn] " + game.id + ": removed its recomp build (Source/Guest/" + game.name + "_recomp)", background);
+        }
+    }
     return ok;
 }
 
@@ -479,6 +565,39 @@ bool SetupGames(const std::string& decomp, bool background)
 }
 
 const char* kDoneHint = "Reload Native Addons so the editor compiles the translated games into com.recomp.gcn";
+
+// The recomp build unpacks the disc into the project's Assets/Recomp/<name>/Disc while the
+// editor runs: tell the asset manager about those files (raw assets), so packaging copies them
+// without a project reload. Main thread only.
+void RegisterRecompAssets()
+{
+    AssetManager* am = AssetManager::Get();
+    if (am == nullptr) return;
+    std::string project = Slashes(GetEngineState()->mProjectDirectory);
+    if (!project.empty() && project.back() != '/') project += "/";
+    for (const GamePackage& game : FindGamePackages())
+    {
+        if (!UseRecomp(game)) continue;
+        const std::string rel = "Assets/Recomp/" + game.name + "/Disc";
+        std::error_code ec;
+        const std::filesystem::path root(project + rel);
+        if (!std::filesystem::is_directory(root, ec)) continue;
+        size_t n = 0;
+        for (auto it = std::filesystem::recursive_directory_iterator(root, ec);
+             !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec))
+        {
+            if (!it->is_regular_file(ec)) continue;
+            RawAssetEntry entry;
+            entry.mAbsolutePath = project + rel + "/" +
+                                  Slashes(std::filesystem::relative(it->path(), root, ec).generic_string());
+            entry.mEngineAsset = false;
+            am->AddRawAssetEntry(entry);
+            ++n;
+        }
+        LogDebug("[gcn] %s: %u disc files in %s are raw assets (packaged with the game)", game.id.c_str(), (unsigned)n,
+                 rel.c_str());
+    }
+}
 
 // runs `work` on the background thread (one run at a time)
 template <typename Fn>
@@ -656,11 +775,40 @@ bool DrawPreprocessModal(void*)
         m.statusGeneration = sStatusGeneration;
     }
 
-    ImGui::TextWrapped("%s comes as code only: no game data. Point this at your own disc image and the decomp; "
-                       "Pre Process translates the decomp into com.recomp.gcn (compiled when the editor loads its "
-                       "addons) and unpacks the disc's files into Packages/%s/Assets/Disc, where the game reads "
-                       "them and packaging takes them along (and where file mods go).",
-                       game.title.c_str(), game.id.c_str());
+    if (game.hasRecomp)
+    {
+        static const char* const kModes[] = {"auto", "decomp", "recomp"};
+        static const char* const kModeNames[] = {"Auto (as last built)", "Decomp", "Recomp (Windows)"};
+        int mode = sMode == "decomp" ? 1 : sMode == "recomp" ? 2 : 0;
+        ImGui::SetNextItemWidth(260.0f);
+        if (ImGui::Combo("Build mode", &mode, kModeNames, 3))
+        {
+            sMode = kModes[mode];
+            m.statusGeneration = -1;
+        }
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("Decomp: the decompilation compiled for every platform.\n"
+                              "Recomp: the disc's own code recompiled (Windows x64).\n"
+                              "Packaging uses Packaging > Target Options > GCN Recomp > Build mode.");
+        }
+    }
+    if (UseRecomp(game))
+    {
+        ImGui::TextWrapped("%s comes as code only: no game data. Point this at your own disc image (and the decomp, "
+                           "whose headers the runtime builds against); Pre Process recompiles the disc's code into "
+                           "com.recomp.gcn and unpacks the disc's files into the project's Assets/Recomp/%s/Disc, "
+                           "where the game reads them and packaging takes them along.",
+                           game.title.c_str(), game.name.c_str());
+    }
+    else
+    {
+        ImGui::TextWrapped("%s comes as code only: no game data. Point this at your own disc image and the decomp; "
+                           "Pre Process translates the decomp into com.recomp.gcn (compiled when the editor loads its "
+                           "addons) and unpacks the disc's files into Packages/%s/Assets/Disc, where the game reads "
+                           "them and packaging takes them along (and where file mods go).",
+                           game.title.c_str(), game.id.c_str());
+    }
     ImGui::Spacing();
 
     // disc image
@@ -876,6 +1024,10 @@ bool GcnDependencies::SetupAll(const char* decompDir)
     const bool ok = SetupGames(decompDir ? decompDir : "", false);
     sStatusValid = false;
     ++sStatusGeneration;
+    if (ok)
+    {
+        RegisterRecompAssets(); // before packaging copies the raw assets
+    }
     return ok;
 }
 
@@ -904,6 +1056,7 @@ void GcnDependencies::Tick()
         sStatusValid = false;
         ++sStatusGeneration;
         if (sThread.joinable()) sThread.join();
+        RegisterRecompAssets();
     }
 }
 
@@ -929,6 +1082,13 @@ void GcnDependencies::CheckReady()
                        game.id.c_str());
         }
     }
+}
+
+void GcnDependencies::SetBuildMode(const char* mode)
+{
+    const std::string m = mode ? mode : "";
+    sMode = (m == "decomp" || m == "recomp") ? m : "auto";
+    sStatusValid = false;
 }
 
 void GcnDependencies::DrawTargetOptions(const PolyphaseBuildContext* ctx)
@@ -962,7 +1122,26 @@ void GcnDependencies::DrawTargetOptions(const PolyphaseBuildContext* ctx)
     {
         decomp[0] = 0;
         if (ctx->GetProfileSetting != nullptr) ctx->GetProfileSetting(kDecompOption, decomp, sizeof(decomp));
+        char mode[16] = "";
+        if (ctx->GetProfileSetting != nullptr && ctx->GetProfileSetting(kModeOption, mode, sizeof(mode))) SetBuildMode(mode);
         decompLoaded = true;
+    }
+    {
+        static const char* const kModes[] = {"auto", "decomp", "recomp"};
+        static const char* const kModeNames[] = {"Auto", "Decomp", "Recomp (Windows)"};
+        int mode = sMode == "decomp" ? 1 : sMode == "recomp" ? 2 : 0;
+        if (ImGui::Combo("Build mode", &mode, kModeNames, 3))
+        {
+            SetBuildMode(kModes[mode]);
+            if (ctx->SetProfileSetting != nullptr) ctx->SetProfileSetting(kModeOption, kModes[mode]);
+        }
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("Decomp: each game package's decompilation compiled to portable C (every platform).\n"
+                              "Recomp: the game's own code from your disc recompiled (Windows x64; packages with\n"
+                              "a Recomp/ folder); its disc is unpacked into the project's Assets/Recomp/<game>.\n"
+                              "Auto: as each game was last built, else its decomp.");
+        }
     }
     if (ImGui::InputText("Decomp folder", decomp, sizeof(decomp)) && ctx->SetProfileSetting != nullptr)
     {
@@ -993,7 +1172,7 @@ void GcnDependencies::DrawTargetOptions(const PolyphaseBuildContext* ctx)
     for (const GameStatus& game : sStatus)
     {
         if (game.translated && game.loaded && game.unpacked)
-            ImGui::Text("%s: ready", game.id.c_str());
+            ImGui::Text("%s: ready (%s)", game.id.c_str(), game.recomp ? "recomp" : "decomp");
         else
             ImGui::TextColored(kWarn, "%s: %s", game.id.c_str(),
                                !game.translated ? "needs Pre Process Rom"

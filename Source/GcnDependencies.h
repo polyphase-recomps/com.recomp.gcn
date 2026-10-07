@@ -23,6 +23,15 @@ namespace GcnDependencies
 constexpr const char* kSetupOption = "gcn.setupDependencies";
 // build profile setting: the decomp checkout (empty: gcn_game.json's "decomp")
 constexpr const char* kDecompOption = "gcn.decompDir";
+// build profile setting: how game packages are built
+//   "auto"    (default) what the game was last built as (Source/Guest/<name>_recomp/mode.txt),
+//             else the decomp when the package has one, else recomp
+//   "decomp"  Native/build.ps1: the decomp compiled to portable C (every platform)
+//   "recomp"  Runtime/tools/recomp/build_recomp.ps1: the disc's code recompiled (Windows x64),
+//             for packages with a Recomp/ folder
+constexpr const char* kModeOption = "gcn.buildMode";
+
+void SetBuildMode(const char* mode);
 
 bool SetupAll(const char* decompDir);
 void SetupAllAsync(const char* decompDir);

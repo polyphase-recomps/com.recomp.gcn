@@ -271,8 +271,25 @@ bool GcnPlayer::StartGame()
                     "then Reload Native Addons (or package again)."});
         return false;
     }
+    // the game's build name: a recomp build's module is "<name>recomp" (build_recomp.ps1); both
+    // builds of a game share its unpacked disc and its saves
+    std::string baseName = module->name;
+    if (baseName.size() > 6 && baseName.compare(baseName.size() - 6, 6, "recomp") == 0)
+    {
+        baseName.resize(baseName.size() - 6);
+    }
     std::string disc, saves;
     ResolveGameDefaults(disc, saves);
+    if (mDiscPath.empty())
+    {
+        // the disc the recomp build unpacked into the project (Assets/Recomp/<name>/Disc) comes
+        // before the package's own (Disc Image set by hand still wins)
+        const std::string projectDisc = "Assets/Recomp/" + baseName + "/Disc";
+        if (gcn_disc_is_unpacked(ResolvePath(projectDisc).c_str()))
+        {
+            disc = projectDisc;
+        }
+    }
     if (disc.empty())
     {
         const std::string where = ResolvePath("Packages/" + mGame + "/Assets/Disc");
@@ -286,7 +303,7 @@ bool GcnPlayer::StartGame()
     }
     if (saves.empty())
     {
-        saves = std::string("Saves/") + module->name;
+        saves = std::string("Saves/") + baseName;
     }
     if (!GcnGuestHost::Start(module, ResolvePath(disc), ResolvePath(saves)))
     {

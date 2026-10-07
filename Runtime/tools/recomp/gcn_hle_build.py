@@ -153,7 +153,7 @@ def main():
     dtk = dtk_symbols(symbols_txt)
     hle = [l.split()[1] for l in open(a.syms) if l.startswith('hle ')]
 
-    b.extract()
+    # (no extract step: the runtime sources include nothing the decomp extracts from the disc)
     units = b.units()
     b.write_mods_list(units)
     units = b.units_with_generated(units) + [b.stubs_unit()]
