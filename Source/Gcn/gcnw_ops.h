@@ -72,3 +72,18 @@ void gcnw_bad_indirect_call(uint32_t index);
 #undef CHECK_CALL_INDIRECT
 #define CHECK_CALL_INDIRECT(table, ft, x) \
   (LIKELY((x) < table.size && table.data[x].func) || (gcnw_bad_indirect_call(x), 0))
+
+/* The recomp build (Runtime/recomp): the runtime's SDK code is a wasm2c module, the game is
+ * recompiled PowerPC, so a function pointer the game handed over (a thread entry, a callback)
+ * is a PowerPC code address, not a table slot. Such calls run the recompiled function at that
+ * address (Runtime/recomp/recomp_gcn.c gcnw_guest_callback). gcn_hle_build.py writes the
+ * instance argument of indirect calls as GCNW_TABLE_INSTANCE so it never indexes the table
+ * with an address. Decomp builds don't define GCNW_RECOMP and are unchanged. */
+#ifdef GCNW_RECOMP
+void *gcnw_guest_callback(uint32_t address);
+#define GCNW_TABLE_INSTANCE(table, x) (LIKELY((x) < (table).size) ? (table).data[x].module_instance : (void *)0)
+#undef CALL_INDIRECT
+#define CALL_INDIRECT(table, t, ft, x, ...)                                              \
+  ((LIKELY((x) < table.size && table.data[x].func)) ? ((t)table.data[x].func)(__VA_ARGS__) \
+                                                     : ((t)gcnw_guest_callback(x))(__VA_ARGS__))
+#endif

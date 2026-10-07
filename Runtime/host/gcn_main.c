@@ -3,7 +3,7 @@
  * Polyphase addon uses, without the engine. Mostly a test harness:
  *
  *   gcn_runner --disc game.iso [--frames N] [--dump DIR] [--every N] [--dump-from F]
- *              [--realtime] [--log FILE] [--wav FILE]
+ *              [--realtime] [--fixed-clock] [--log FILE] [--wav FILE]
  *
  * Frames are written as PPM (DIR/frame_NNNNN.ppm). Without --realtime the game runs as
  * fast as it can (vertical retraces do not wait).
@@ -36,6 +36,9 @@ static void backtrace_log(void);
 static GcnDisc *sDisc;
 static FILE *sLog;
 static int sFrames = 600, sEvery = 60, sDumpFrom = 0, sRealtime, sStackAt = -1, sWatchEvery = 60;
+/* --fixed-clock: the guest's clock is the retrace count (1/60 s each), so two builds of a game
+ * (decomp, recomp) see the same time and frame-pace the same way: comparable frame dumps */
+static int sFixedClock;
 
 /* --script "F:BUTTONS[:DURATION],...": hold the pad buttons (hex, GCN_PAD_*) from retrace F
  * for DURATION retraces (default 6). Without a script START is pressed now and then. */
@@ -304,6 +307,7 @@ void gcnp_crashed(void)
 
 uint64_t gcnp_time_us(void)
 {
+    if (sFixedClock) return (uint64_t)sFrame * 16667u;
 #ifdef _WIN32
     static LARGE_INTEGER freq;
     LARGE_INTEGER now;
@@ -758,6 +762,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--every") && i + 1 < argc) sEvery = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump-from") && i + 1 < argc) sDumpFrom = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--realtime")) sRealtime = 1;
+        else if (!strcmp(argv[i], "--fixed-clock")) sFixedClock = 1;
         else if (!strcmp(argv[i], "--stack-at") && i + 1 < argc) sStackAt = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--map") && i + 1 < argc) map = argv[++i];
         else if (!strcmp(argv[i], "--watch") && i + 1 < argc) watch = argv[++i];
@@ -770,7 +775,7 @@ int main(int argc, char **argv)
         else
         {
             fprintf(stderr, "usage: gcn_runner --disc game.iso [--frames N] [--dump DIR] [--every N] "
-                            "[--dump-from F] [--realtime] [--log FILE] [--wav FILE]\n");
+                            "[--dump-from F] [--realtime] [--fixed-clock] [--log FILE] [--wav FILE]\n");
             return 2;
         }
     }
