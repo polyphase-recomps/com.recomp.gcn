@@ -83,6 +83,36 @@ class Toolchain:
         self.wasm_ld = os.path.join(wasi, 'bin', 'wasm-ld' + EXE)
         self.wasm2c = os.path.join(wabt, 'bin', 'wasm2c' + EXE)
         self.wasi = wasi
+        wabt_dll_path(self.wasm2c)
+
+
+WABT_DLL = 'libcrypto-3-x64.dll'
+
+
+def wabt_dll_path(wasm2c):
+    """The Windows wabt release links OpenSSL (libcrypto-3-x64.dll) without shipping it. A Git Bash
+    shell has it on PATH (Git's mingw64/bin), a process the editor starts does not: wasm2c then
+    exits with 0xC0000135 (DLL not found) and no output. Put a folder that has it on PATH."""
+    if os.name != 'nt':
+        return
+    dirs = [os.path.dirname(wasm2c)] + os.environ.get('PATH', '').split(os.pathsep)
+    if any(d and os.path.isfile(os.path.join(d, WABT_DLL)) for d in dirs):
+        return
+    found = []
+    git = shutil.which('git')
+    if git:
+        root = os.path.dirname(os.path.dirname(os.path.realpath(git)))  # <Git>/cmd/git.exe
+        found.append(os.path.join(root, 'mingw64', 'bin'))
+    for base in (os.environ.get('ProgramFiles'), os.environ.get('ProgramW6432'), os.environ.get('LOCALAPPDATA')):
+        if base:
+            found.append(os.path.join(base, 'Git', 'mingw64', 'bin'))
+            found.append(os.path.join(base, 'Programs', 'Git', 'mingw64', 'bin'))
+    for d in found:
+        if os.path.isfile(os.path.join(d, WABT_DLL)):
+            os.environ['PATH'] = d + os.pathsep + os.environ.get('PATH', '')
+            return
+    print('gcn_build: warning: %s (needed by %s) was not found next to it, on PATH or in a Git '
+          'install; copy it into %s' % (WABT_DLL, os.path.basename(wasm2c), os.path.dirname(wasm2c)))
 
 
 # ---- helpers ------------------------------------------------------------------------
