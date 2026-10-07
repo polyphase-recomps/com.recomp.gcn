@@ -210,6 +210,17 @@ def main():
     rc, out = gcn_build.run(cmd)
     print(out.strip())
     if rc:
+        # once seen from the editor without any message (a freshly written folder still locked by
+        # a scanner?): say what wasm2c itself reports, then try once more
+        import time
+        trimmed = os.path.splitext(wasm)[0] + '.trimmed.wasm'
+        probe = os.path.join(b.out, 'wasm2c_probe.c')
+        rc2, out2 = gcn_build.run([b.tc.wasm2c, trimmed, '-n', b.name, '--disable-tail-call', '-o', probe])
+        print('gcn_hle_build: wasm2c on its own: exit %d %s' % (rc2, out2.strip()))
+        time.sleep(2)
+        rc, out = gcn_build.run(cmd)
+        print(out.strip())
+    if rc:
         raise SystemExit('gcn_hle_build: wasm2c failed')
     # indirect calls: the instance argument must not index the table with a PowerPC address
     # (gcnw_ops.h GCNW_RECOMP)
