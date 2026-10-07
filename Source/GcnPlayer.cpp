@@ -14,6 +14,7 @@
 #include "Plugins/PolyphaseEngineAPI.h"
 
 #include "GcnGuestHost.h"
+#include "GcnLauncher.h"
 #include "GcnProvider.h"
 
 // com.recomp.mod.base: mod settings, resolution scaler, shared menus
@@ -83,6 +84,18 @@ void GcnPlayer::SetPaused(bool paused)
 bool GcnPlayer::IsPaused()
 {
     return sPaused;
+}
+
+void GcnPlayer::RestartGame(const std::string& package)
+{
+    for (GcnPlayer* player : sLivePlayers)
+    {
+        if (player->mGame == package)
+        {
+            player->StopGame();
+            player->mStartAttempted = false; // the next tick starts it
+        }
+    }
 }
 
 GcnPlayer::GcnPlayer()
@@ -282,10 +295,16 @@ bool GcnPlayer::StartGame()
     ResolveGameDefaults(disc, saves);
     if (mDiscPath.empty())
     {
-        // the disc the recomp build unpacked into the project (Assets/Recomp/<name>/Disc) comes
-        // before the package's own (Disc Image set by hand still wins)
+        // the disc the player chose in the launcher (GcnLauncher), then the one the recomp build
+        // unpacked into the project (Assets/Recomp/<name>/Disc), then the package's own (Disc
+        // Image set by hand still wins)
+        const std::string chosen = GcnLauncher::ChosenDisc(mGame);
         const std::string projectDisc = "Assets/Recomp/" + baseName + "/Disc";
-        if (gcn_disc_is_unpacked(ResolvePath(projectDisc).c_str()))
+        if (!chosen.empty())
+        {
+            disc = chosen;
+        }
+        else if (gcn_disc_is_unpacked(ResolvePath(projectDisc).c_str()))
         {
             disc = projectDisc;
         }
@@ -293,11 +312,13 @@ bool GcnPlayer::StartGame()
     if (disc.empty())
     {
         const std::string where = ResolvePath("Packages/" + mGame + "/Assets/Disc");
-        LogError("GcnPlayer: no disc for %s: run Setup Dependencies (it unpacks your disc into %s), or set Disc Image",
+        LogError("GcnPlayer: no disc for %s: choose it in a launcher scene (GcnLauncher), run Setup Dependencies (it "
+                 "unpacks your disc into %s), or set Disc Image",
                  module->title, where.c_str());
         ShowStatus({std::string("No game disc for ") + module->title + ".",
-                    "Packaging > Target Options > GCN Recomp > Setup Dependencies Now",
-                    "unpacks your own disc image into the game package, then package again.",
+                    "Choose your disc image in the game's launcher scene,",
+                    "or Packaging > Target Options > GCN Recomp > Setup Dependencies Now",
+                    "unpacks your own disc image into the project, then package again.",
                     "Looked in:", where});
         return false;
     }

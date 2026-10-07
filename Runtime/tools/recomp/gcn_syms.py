@@ -16,11 +16,18 @@ and writes a plain text file the recompiler reads:
     label <addr> <name>       labels inside text (extra entry points)
     jumptable <addr> <size>   data objects that may be switch tables (absolute code addresses)
     hle <name>                functions the runtime supplies instead of the recompiled code
+    data <addr> <size> <name> the decomp's globals at their DOL addresses (--placed): what the
+                              package's mods name, in the recomp build too
 
 The HLE set is what the decomp build takes from com.recomp.gcn's runtime instead of the decomp:
 every function its link map (wasm-ld -Map, e.g. Native/build/Release/sfa.map) places in a
 `runtime_*` object. --write-hle saves that list so a package can ship it (names only) and build
 without the decomp: --hle reads it back.
+
+--placed takes the decomp build's placed data symbols (gcn_place.py's <name>.syms, next to the
+map): its names are the decomp's own (symbols.txt names many of them lbl_*), and gcn_place.py
+found their addresses by name or by contents. Only addresses in the DOL's data sections or its
+bss count (what gcn_place.py left at the linker's addresses is not the game's).
 """
 import argparse
 import hashlib
@@ -52,6 +59,27 @@ def dol_sections(dol):
     entry = struct.unpack(">I", dol[0xE0:0xE4])[0]
     text = [(addrs[i], sizes[i], offs[i]) for i in range(7) if sizes[i]]
     return text, entry
+
+
+def dol_data_ranges(dol):
+    """[(start, end)] of the DOL's data sections and its bss."""
+    addrs = struct.unpack(">18I", dol[0x48:0x90])
+    sizes = struct.unpack(">18I", dol[0x90:0xD8])
+    bss, bss_size = struct.unpack(">II", dol[0xD8:0xE0])
+    return [(addrs[i], addrs[i] + sizes[i]) for i in range(7, 18) if sizes[i]] + [(bss, bss + bss_size)]
+
+
+def read_placed(path, ranges):
+    """gcn_place.py's '<addr> 0 <size> <name>' lines that sit in the DOL's data."""
+    out = {}
+    for line in open(path, encoding="utf-8"):
+        f = line.split()
+        if len(f) != 4 or line.startswith("#"):
+            continue
+        addr, size, name = int(f[0], 16), int(f[2], 16), f[3]
+        if size and any(lo <= addr and addr + size <= hi for lo, hi in ranges):
+            out.setdefault(name, (addr, size))
+    return out
 
 
 def word_at(dol, text, addr):
@@ -101,6 +129,7 @@ def main():
     ap.add_argument("--map", help="the decomp build's wasm-ld map (HLE set from runtime_* objects)")
     ap.add_argument("--hle", help="a saved HLE list (one name per line)")
     ap.add_argument("--write-hle", help="save the HLE list here")
+    ap.add_argument("--placed", help="the decomp build's placed data symbols (gcn_place.py's <name>.syms)")
     args = ap.parse_args()
 
     dol = open(args.dol, "rb").read()
@@ -157,8 +186,11 @@ def main():
             f.write("jumptable 0x%08X 0x%X\n" % (s["addr"], s["size"]))
         for n in sorted(hle):
             f.write("hle %s\n" % n)
-    print("%d functions, %d labels, %d jump tables, %d HLE, r2=%s r13=%s" %
-          (len(funcs), len(labels), len(tables), len(hle), hex(bases.get(2, 0)), hex(bases.get(13, 0))))
+        placed = read_placed(args.placed, dol_data_ranges(dol)) if args.placed else {}
+        for n, (addr, size) in sorted(placed.items(), key=lambda x: (x[1][0], x[0])):
+            f.write("data 0x%08X 0x%X %s\n" % (addr, size, n))
+    print("%d functions, %d labels, %d jump tables, %d HLE, %d data, r2=%s r13=%s" %
+          (len(funcs), len(labels), len(tables), len(hle), len(placed), hex(bases.get(2, 0)), hex(bases.get(13, 0))))
     return 0
 
 

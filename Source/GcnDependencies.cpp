@@ -14,7 +14,10 @@
  * com.recomp.gcn/Runtime/tools/recomp/build_recomp.ps1 recompiles the disc's own code into a
  * library in com.recomp.gcn/Lib, registered by Source/Guest/<name>_recomp, and unpacks the disc
  * into the PROJECT (Assets/Recomp/<name>/Disc): what the game reads at run time stays out of the
- * packages. The two builds of a game replace each other.
+ * packages. The two builds of a game replace each other. Build mode "live" (build_recomp.ps1
+ * -Live) makes a library without the game's code that recompiles it from the disc when the game
+ * starts: no disc needed to build, and with "Package the unpacked disc" off the packaged game
+ * holds no game data at all (the player picks their disc in a launcher scene, GcnLauncher).
  *
  * Tools > Recomp > GameCube > Pre Process Rom is the window for that: pick your disc image
  * and the decomp (saved to the game package's Native/local.json, not in git), check
@@ -90,6 +93,7 @@ struct GameStatus
     bool unpacked;   // Assets/Disc/disc.idx exists
     std::string unpackedId; // the game id written in it
     bool recomp = false;    // built (or to be built) as the recomp build
+    bool live = false;      // ...a Live one (needs no unpacked disc)
 };
 
 std::mutex sLock;
@@ -108,6 +112,7 @@ HANDLE sJob = nullptr;             // the running build and everything it starts
 #endif
 
 std::string sMode = "auto";      // kModeOption, set by the Target Options / before packaging
+bool sPackageDisc = true;        // kPackageDiscOption
 std::vector<GameStatus> sStatus; // Target Options panel, refreshed on demand
 bool sStatusValid = false;
 int sStatusGeneration = 0;       // bumped when a run ends
@@ -406,13 +411,22 @@ std::string AddonDir()
     return ProjectDir() + "Packages/com.recomp.gcn/";
 }
 
-// whether this game is built (or to be built) as the recomp build
+// whether this game is built (or to be built) as the recomp build (AOT or Live)
 bool UseRecomp(const GamePackage& game)
 {
     if (!game.hasRecomp) return false;
-    if (!game.hasDecomp || sMode == "recomp") return true;
+    if (!game.hasDecomp || sMode == "recomp" || sMode == "live") return true;
     if (sMode == "decomp") return false;
     return Exists(AddonDir() + "Source/Guest/" + game.name + "_recomp/mode.txt"); // auto: as last built
+}
+
+// ...and as the Live one (recompiled from the disc when the game starts)
+bool UseLive(const GamePackage& game)
+{
+    if (!UseRecomp(game)) return false;
+    if (sMode == "live") return true;
+    if (sMode == "recomp") return false;
+    return Trim(ReadText(AddonDir() + "Source/Guest/" + game.name + "_recomp/mode.txt")) == "recomp-live";
 }
 
 // where the build unpacks the disc: the project for the recomp build (Assets/Recomp/<name>/Disc),
@@ -428,6 +442,7 @@ GameStatus GetGameStatus(const GamePackage& game)
     GameStatus s;
     s.id = game.id;
     s.recomp = UseRecomp(game);
+    s.live = UseLive(game);
     s.translated = s.recomp ? Exists(AddonDir() + "Source/Guest/" + game.name + "_recomp/" + game.name +
                                      "_recomp_guest_register.cpp")
                             : Exists(AddonDir() + "Source/Guest/" + game.name + "/" + game.name + "_guest_module.c");
@@ -477,6 +492,7 @@ bool SetupRecomp(const GamePackage& game, const std::string& decomp, const std::
     std::string args = "-Package \"" + game.packageDir + "\"";
     if (!decomp.empty()) args += " -Decomp \"" + decomp + "\"";
     if (!disc.empty()) args += " -Disc \"" + disc + "\"";
+    if (UseLive(game)) args += " -Live";
 #if defined(_DEBUG)
     args += " -DebugCrt"; // the library's C runtime matches this Debug editor
 #endif
@@ -579,6 +595,13 @@ void RegisterRecompAssets()
     {
         if (!UseRecomp(game)) continue;
         const std::string rel = "Assets/Recomp/" + game.name + "/Disc";
+        if (!sPackageDisc)
+        {
+            LogDebug("[gcn] %s: %s stays out of the package (Package the unpacked disc is off): the game asks the "
+                     "player for their disc",
+                     game.id.c_str(), rel.c_str());
+            continue;
+        }
         std::error_code ec;
         const std::filesystem::path root(project + rel);
         if (!std::filesystem::is_directory(root, ec)) continue;
@@ -777,11 +800,12 @@ bool DrawPreprocessModal(void*)
 
     if (game.hasRecomp)
     {
-        static const char* const kModes[] = {"auto", "decomp", "recomp"};
-        static const char* const kModeNames[] = {"Auto (as last built)", "Decomp", "Recomp (Windows)"};
-        int mode = sMode == "decomp" ? 1 : sMode == "recomp" ? 2 : 0;
+        static const char* const kModes[] = {"auto", "decomp", "recomp", "live"};
+        static const char* const kModeNames[] = {"Auto (as last built)", "Decomp", "Recomp (Windows)",
+                                                 "Recomp Live (Windows)"};
+        int mode = sMode == "decomp" ? 1 : sMode == "recomp" ? 2 : sMode == "live" ? 3 : 0;
         ImGui::SetNextItemWidth(260.0f);
-        if (ImGui::Combo("Build mode", &mode, kModeNames, 3))
+        if (ImGui::Combo("Build mode", &mode, kModeNames, 4))
         {
             sMode = kModes[mode];
             m.statusGeneration = -1;
@@ -789,11 +813,21 @@ bool DrawPreprocessModal(void*)
         if (ImGui::IsItemHovered())
         {
             ImGui::SetTooltip("Decomp: the decompilation compiled for every platform.\n"
-                              "Recomp: the disc's own code recompiled (Windows x64).\n"
+                              "Recomp: the disc's own code recompiled ahead of time (Windows x64).\n"
+                              "Recomp Live: recompiled from the disc when the game starts; the build holds no game\n"
+                              "code and needs no disc (Windows x64).\n"
                               "Packaging uses Packaging > Target Options > GCN Recomp > Build mode.");
         }
     }
-    if (UseRecomp(game))
+    if (UseLive(game))
+    {
+        ImGui::TextWrapped("%s Live: com.recomp.gcn gets the runtime and the game's symbols only, and recompiles the "
+                           "game from the disc when it starts (no compiler, no game code in the build). The decomp "
+                           "is still needed to build (the runtime's headers); a disc image here is unpacked into the "
+                           "project's Assets/Recomp/%s/Disc for playing in the editor.",
+                           game.title.c_str(), game.name.c_str());
+    }
+    else if (UseRecomp(game))
     {
         ImGui::TextWrapped("%s comes as code only: no game data. Point this at your own disc image (and the decomp, "
                            "whose headers the runtime builds against); Pre Process recompiles the disc's code into "
@@ -1087,8 +1121,13 @@ void GcnDependencies::CheckReady()
 void GcnDependencies::SetBuildMode(const char* mode)
 {
     const std::string m = mode ? mode : "";
-    sMode = (m == "decomp" || m == "recomp") ? m : "auto";
+    sMode = (m == "decomp" || m == "recomp" || m == "live") ? m : "auto";
     sStatusValid = false;
+}
+
+void GcnDependencies::SetPackageDisc(bool package)
+{
+    sPackageDisc = package;
 }
 
 void GcnDependencies::DrawTargetOptions(const PolyphaseBuildContext* ctx)
@@ -1124,13 +1163,16 @@ void GcnDependencies::DrawTargetOptions(const PolyphaseBuildContext* ctx)
         if (ctx->GetProfileSetting != nullptr) ctx->GetProfileSetting(kDecompOption, decomp, sizeof(decomp));
         char mode[16] = "";
         if (ctx->GetProfileSetting != nullptr && ctx->GetProfileSetting(kModeOption, mode, sizeof(mode))) SetBuildMode(mode);
+        char pack[8] = "";
+        if (ctx->GetProfileSetting != nullptr && ctx->GetProfileSetting(kPackageDiscOption, pack, sizeof(pack)))
+            SetPackageDisc(pack[0] != '0');
         decompLoaded = true;
     }
     {
-        static const char* const kModes[] = {"auto", "decomp", "recomp"};
-        static const char* const kModeNames[] = {"Auto", "Decomp", "Recomp (Windows)"};
-        int mode = sMode == "decomp" ? 1 : sMode == "recomp" ? 2 : 0;
-        if (ImGui::Combo("Build mode", &mode, kModeNames, 3))
+        static const char* const kModes[] = {"auto", "decomp", "recomp", "live"};
+        static const char* const kModeNames[] = {"Auto", "Decomp", "Recomp (Windows)", "Recomp Live (Windows)"};
+        int mode = sMode == "decomp" ? 1 : sMode == "recomp" ? 2 : sMode == "live" ? 3 : 0;
+        if (ImGui::Combo("Build mode", &mode, kModeNames, 4))
         {
             SetBuildMode(kModes[mode]);
             if (ctx->SetProfileSetting != nullptr) ctx->SetProfileSetting(kModeOption, kModes[mode]);
@@ -1138,9 +1180,23 @@ void GcnDependencies::DrawTargetOptions(const PolyphaseBuildContext* ctx)
         if (ImGui::IsItemHovered())
         {
             ImGui::SetTooltip("Decomp: each game package's decompilation compiled to portable C (every platform).\n"
-                              "Recomp: the game's own code from your disc recompiled (Windows x64; packages with\n"
-                              "a Recomp/ folder); its disc is unpacked into the project's Assets/Recomp/<game>.\n"
+                              "Recomp: the game's own code from your disc recompiled ahead of time (Windows x64;\n"
+                              "packages with a Recomp/ folder); its disc is unpacked into the project's\n"
+                              "Assets/Recomp/<game>.\n"
+                              "Recomp Live: no game code in the build; recompiled from the disc when the game starts.\n"
                               "Auto: as each game was last built, else its decomp.");
+        }
+        bool packDisc = sPackageDisc;
+        if (ImGui::Checkbox("Package the unpacked disc", &packDisc))
+        {
+            SetPackageDisc(packDisc);
+            if (ctx->SetProfileSetting != nullptr) ctx->SetProfileSetting(kPackageDiscOption, packDisc ? "1" : "0");
+        }
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("Recomp builds: the disc unpacked into Assets/Recomp/<game>/Disc goes into the package.\n"
+                              "Off (with Recomp Live: a build without any game data): the packaged game asks the\n"
+                              "player for their own disc in a launcher scene (Tools > Recomp > Mods > Launcher).");
         }
     }
     if (ImGui::InputText("Decomp folder", decomp, sizeof(decomp)) && ctx->SetProfileSetting != nullptr)
@@ -1171,8 +1227,8 @@ void GcnDependencies::DrawTargetOptions(const PolyphaseBuildContext* ctx)
     }
     for (const GameStatus& game : sStatus)
     {
-        if (game.translated && game.loaded && game.unpacked)
-            ImGui::Text("%s: ready (%s)", game.id.c_str(), game.recomp ? "recomp" : "decomp");
+        if (game.translated && game.loaded && (game.unpacked || game.live))
+            ImGui::Text("%s: ready (%s)", game.id.c_str(), game.live ? "recomp live" : game.recomp ? "recomp" : "decomp");
         else
             ImGui::TextColored(kWarn, "%s: %s", game.id.c_str(),
                                !game.translated ? "needs Pre Process Rom"
@@ -1211,6 +1267,12 @@ void GcnDependencies::RegisterEditorUI(EditorUIHooks*, uint64_t)
 {
 }
 void GcnDependencies::Cancel()
+{
+}
+void GcnDependencies::SetBuildMode(const char*)
+{
+}
+void GcnDependencies::SetPackageDisc(bool)
 {
 }
 

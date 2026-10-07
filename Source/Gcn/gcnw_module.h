@@ -45,6 +45,9 @@ typedef struct GcnwModule
 void gcnw_register_module(const GcnwModule *module);
 /* by package id; NULL or "" gives the first registered game */
 const GcnwModule *gcnw_find_module(const char *package);
+/* every registered game (GcnLauncher) */
+int gcnw_module_count(void);
+const GcnwModule *gcnw_module_at(int index);
 
 #ifdef __cplusplus
 }

@@ -18,6 +18,7 @@
 #endif
 
 #include "GcnDependencies.h"
+#include "GcnLauncher.h"
 #include "GcnLua.h"
 #include "GcnPlayer.h"
 #include "GcnProvider.h"
@@ -29,8 +30,10 @@ static int OnLoad(PolyphaseEngineAPI* api)
     sEngineAPI = api;
     GcnPlayer::SetEngineAPI(api);
     FORCE_LINK_CALL(GcnPlayer);
-    // com.recomp.mod.base (mod settings, Recomp / Mods Lua, Mods windows) sees the game
+    // com.recomp.mod.base (mod settings, Recomp / Mods Lua, Mods windows) sees the game, and
+    // its launcher scenes can start every game of the addon from the player's disc
     Recomp_RegisterProvider(&GcnProvider::Get());
+    GcnLauncher::RegisterAll();
     if (api && api->LogDebug)
     {
         api->LogDebug("com.recomp.gcn loaded!");
@@ -42,6 +45,7 @@ static void OnUnload()
 {
     // the game thread runs this module's code: stop it first
     GcnPlayer::ShutdownAll();
+    GcnLauncher::UnregisterAll();
     Recomp_UnregisterProvider(&GcnProvider::Get());
     GcnPlayer::SetEngineAPI(nullptr);
     if (sEngineAPI && sEngineAPI->LogDebug)
@@ -83,6 +87,11 @@ static bool OnPreBuild(int32_t platform, void* userData)
         if (sHooks->GetBuildSetting(GcnDependencies::kModeOption, mode, sizeof(mode)))
         {
             GcnDependencies::SetBuildMode(mode);
+        }
+        char pack[8] = "";
+        if (sHooks->GetBuildSetting(GcnDependencies::kPackageDiscOption, pack, sizeof(pack)))
+        {
+            GcnDependencies::SetPackageDisc(pack[0] != '0');
         }
     }
     if (!GcnDependencies::SetupAll(decomp))

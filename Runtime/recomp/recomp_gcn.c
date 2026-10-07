@@ -33,15 +33,25 @@ void w2c_env_0x5F_gcn_vstore16(struct w2c_env* env, uint32_t addr, uint32_t v);
 void w2c_env_0x5F_gcn_vstore32(struct w2c_env* env, uint32_t addr, uint32_t v);
 uint64_t w2c_env_gcn_host_ticks(struct w2c_env* env);
 
-/* the generated tables (GcnRecomp's functable.c and game.c, gen_hle_glue.py) */
+/* the generated tables (GcnRecomp's functable.c and game.c, gen_hle_glue.py); a Live build
+ * (GCNR_LIVE, live/recomp_live.cpp) fills them when the game first needs them */
 typedef struct gcnr_function
 {
     uint32_t addr;
     gcnr_func fn;
 } gcnr_function;
+#if GCNR_LIVE
+extern const gcnr_function* gcnr_functions;
+extern uint32_t gcnr_function_count;
+extern uint32_t gcnr_r2, gcnr_r13, gcnr_ctors;
+void gcnr_live_ensure(void);
+#define LIVE_ENSURE() gcnr_live_ensure()
+#else
 extern const gcnr_function gcnr_functions[];
 extern const uint32_t gcnr_function_count;
 extern const uint32_t gcnr_r2, gcnr_r13, gcnr_ctors;
+#define LIVE_ENSURE() ((void)0)
+#endif
 const GcnwModule* gcnr_module(void);
 
 uint32_t gcnr_gqr[8];
@@ -113,6 +123,7 @@ gcnr_func gcnr_lookup(uint32_t addr)
     {
         return sCache[slot].fn;
     }
+    LIVE_ENSURE();
     f = find(addr);
     if (!f || f->addr != addr)
     {
@@ -134,6 +145,7 @@ gcnr_func gcnr_lookup_from(uint32_t addr, const gcnr_ctx* c)
     {
         return sCache[slot].fn;
     }
+    LIVE_ENSURE();
     f = find(a);
     if (!f || f->addr != a)
     {
@@ -187,8 +199,9 @@ static void watch_init(void)
 }
 
 /* ---- calls from the HLE into recompiled code ---------------------------------------------- */
-static void init_ctx(gcnr_ctx* c)
+void gcnr_init_ctx(gcnr_ctx* c)
 {
+    LIVE_ENSURE(); /* r2 / r13 come from the symbols */
     const uint32_t hleSp = *gcnr_module()->stack_pointer();
     memset(c, 0, sizeof(*c));
     c->r[1] = (hleSp - 64u) & ~15u; /* below the HLE's frames */
@@ -197,7 +210,9 @@ static void init_ctx(gcnr_ctx* c)
     c->msr = 0x9032u; /* EE | ME | IR | DR | RI, as a running game sees it */
 }
 
-static uint32_t call_guest(gcnr_ctx* c, uint32_t addr)
+/* calls recompiled code at addr with the registers in c (gcnr_init_ctx, then the arguments);
+ * the results stay in c (r3, r3:r4, f1) */
+uint32_t gcnr_call_ctx(gcnr_ctx* c, uint32_t addr)
 {
     uint8_t* mem = guest_mem();
     /* the back chain and LR slot of the frame the callee hangs below */
@@ -212,7 +227,7 @@ uint32_t gcnr_call_guest(uint32_t addr, int n, const uint32_t* args)
 {
     gcnr_ctx c;
     int i;
-    init_ctx(&c);
+    gcnr_init_ctx(&c);
     if (n > 8)
     {
         c.r[1] -= (uint32_t)((n - 8) * 4 + 16) & ~15u;
@@ -225,7 +240,7 @@ uint32_t gcnr_call_guest(uint32_t addr, int n, const uint32_t* args)
     {
         c.r[3 + i] = args[i];
     }
-    return call_guest(&c, addr);
+    return gcnr_call_ctx(&c, addr);
 }
 
 /* The static constructors (.ctors, from _ctors to the null entry), as __start's __init_cpp runs
@@ -235,6 +250,7 @@ void gcnr_run_ctors(void)
 {
     static int sDone;
     uint32_t p;
+    LIVE_ENSURE();
     if (sDone || !gcnr_ctors) return;
     sDone = 1;
     for (p = gcnr_ctors;; p += 4)
@@ -254,7 +270,7 @@ uint32_t gcnr_call_vsprintf(uint32_t addr, uint32_t buf, uint32_t fmt, uint32_t 
     gcnr_ctx c;
     uint8_t* mem = guest_mem();
     uint32_t va;
-    init_ctx(&c);
+    gcnr_init_ctx(&c);
     va = c.r[1] - 16u;
     gcnr_sb(mem, va + 0, 8); /* gpr */
     gcnr_sb(mem, va + 1, 8); /* fpr */
@@ -265,7 +281,7 @@ uint32_t gcnr_call_vsprintf(uint32_t addr, uint32_t buf, uint32_t fmt, uint32_t 
     c.r[3] = buf;
     c.r[4] = fmt;
     c.r[5] = va;
-    return call_guest(&c, addr);
+    return gcnr_call_ctx(&c, addr);
 }
 
 /* A function pointer the HLE calls (thread entries, DVD / VI / alarm / interrupt callbacks) holds
@@ -280,7 +296,7 @@ static uint64_t callback_trampoline(void* instance, uint32_t a0, uint32_t a1, ui
     const uint32_t target = sCallbackTarget;
     gcnr_ctx c;
     (void)instance;
-    init_ctx(&c);
+    gcnr_init_ctx(&c);
     c.r[3] = a0;
     c.r[4] = a1;
     c.r[5] = a2;
@@ -289,7 +305,7 @@ static uint64_t callback_trampoline(void* instance, uint32_t a0, uint32_t a1, ui
     c.r[8] = a5;
     c.r[9] = a6;
     c.r[10] = a7;
-    return call_guest(&c, target);
+    return gcnr_call_ctx(&c, target);
 }
 
 void* gcnw_guest_callback(uint32_t address)

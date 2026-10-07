@@ -44,6 +44,9 @@ public:
     // Scripts: pause / resume the game (it keeps its last frame on screen).
     static void SetPaused(bool paused);
     static bool IsPaused();
+    // The launcher's Play (GcnLauncher): every player of that game package starts it again,
+    // with the disc the player chose.
+    static void RestartGame(const std::string& package);
 
 private:
     bool StartGame();

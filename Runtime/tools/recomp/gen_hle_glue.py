@@ -9,7 +9,9 @@
    export with the HLE stack just below the caller's, and puts the result in r3 / r3:r4 / f1.
    OSReport and OSPanic build the big-endian variadic buffer the HLE takes (gcnr_va_build).
  - w2c_env_<name>: the game functions the HLE calls (<module>_game_functions.txt: main, the
-   C library's sprintf/vsprintf, ...), as calls of the recompiled code (gcnr_call_guest).
+   C library's sprintf/vsprintf, what the game package's mods call, ...), as calls of the
+   recompiled code (gcnr_call_guest, or gcnr_call_ctx with floating point arguments).
+ - gcnr_hle_functions[]: every hle_<name> by name (Live builds look them up by address).
 """
 import os
 import re
@@ -52,6 +54,8 @@ def main():
     o.append('extern const GcnwModule gcnw_module_%s;' % name)
     o.append('uint32_t gcnr_va_build(uint8_t* mem, gcnr_ctx* c, int fixed, uint32_t at);')
     o.append('uint32_t gcnr_call_guest(uint32_t addr, int n, const uint32_t* args);')
+    o.append('void gcnr_init_ctx(gcnr_ctx* c);')
+    o.append('uint32_t gcnr_call_ctx(gcnr_ctx* c, uint32_t addr);')
     o.append('uint32_t gcnr_call_vsprintf(uint32_t addr, uint32_t buf, uint32_t fmt, uint32_t ap);')
     o.append('void gcnr_run_ctors(void);')
     o.append('extern int gcnr_trace_left;')
@@ -116,18 +120,48 @@ def main():
             continue  # a host import (gcnw_backend.c)
         sig = ', '.join('%s a%d' % ({'u32': 'uint32_t', 'u64': 'uint64_t', 'f32': 'float', 'f64': 'double'}[p], i)
                         for i, p in enumerate(ps))
-        cret = {'void': 'void', 'u32': 'uint32_t', 'u64': 'uint64_t'}[ret]
+        cret = {'void': 'void', 'u32': 'uint32_t', 'u64': 'uint64_t', 'f32': 'float', 'f64': 'double'}[ret]
         o.append('%s %s(struct w2c_env* env%s)\n{' % (cret, fn, ', ' + sig if sig else ''))
         if n == 'vsprintf':
             o.append('    return gcnr_call_vsprintf(0x%08Xu, a0, a1, a2);\n}\n' % game[n])
             continue
-        if any(p != 'u32' for p in ps):
-            raise SystemExit('gen_hle_glue: %s takes non-integer arguments' % n)
         if n == 'main':
             o.append('    gcnr_run_ctors(); /* static constructors first, as __start does */')
-        o.append('    const uint32_t args[] = {%s};' % (', '.join('a%d' % i for i in range(len(ps))) or '0'))
-        call = 'gcnr_call_guest(0x%08Xu, %d, args)' % (game[n], len(ps))
-        o.append('    %s%s;\n}\n' % ('return ' if ret != 'void' else '', call))
+        if all(p == 'u32' for p in ps) and ret in ('void', 'u32'):
+            o.append('    const uint32_t args[] = {%s};' % (', '.join('a%d' % i for i in range(len(ps))) or '0'))
+            call = 'gcnr_call_guest(0x%08Xu, %d, args)' % (game[n], len(ps))
+            o.append('    %s%s;\n}\n' % ('return ' if ret != 'void' else '', call))
+            continue
+        # floating point or 64-bit (mods calling the game): PowerPC EABI registers, as hle_<name>
+        # takes them apart above
+        o.append('    gcnr_ctx c;\n    gcnr_init_ctx(&c);')
+        gpr, fpr = 3, 1
+        for i, p in enumerate(ps):
+            if p == 'u64':
+                gpr += gpr % 2 == 0
+                o.append('    c.r[%d] = (uint32_t)(a%d >> 32);\n    c.r[%d] = (uint32_t)a%d;' % (gpr, i, gpr + 1, i))
+                gpr += 2
+            elif p in ('f32', 'f64'):
+                o.append('    c.f[%d].ps0 = c.f[%d].ps1 = (double)a%d;' % (fpr, fpr, i))
+                fpr += 1
+            else:
+                o.append('    c.r[%d] = a%d;' % (gpr, i))
+                gpr += 1
+        if gpr > 11 or fpr > 9:
+            raise SystemExit('gen_hle_glue: %s takes more arguments than fit in registers' % n)
+        o.append('    gcnr_call_ctx(&c, 0x%08Xu);' % game[n])
+        if ret == 'u64':
+            o.append('    return (uint64_t)c.r[3] << 32 | c.r[4];')
+        elif ret in ('f32', 'f64'):
+            o.append('    return (%s)c.f[1].ps0;' % ('float' if ret == 'f32' else 'double'))
+        elif ret == 'u32':
+            o.append('    return c.r[3];')
+        o.append('}\n')
+
+    o.append('/* the wrappers by name: a Live build finds them by the addresses syms.txt gives those names */')
+    o.append('const gcnr_named_func gcnr_hle_functions[] = {')
+    o += ['    {"%s", hle_%s},' % (n, n) for n in hle if n not in missing]
+    o.append('    {0, 0},\n};')
 
     with open(out_path, 'w', newline='\n') as f:
         f.write('\n'.join(o) + '\n')

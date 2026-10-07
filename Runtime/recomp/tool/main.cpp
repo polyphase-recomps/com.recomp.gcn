@@ -152,8 +152,6 @@ int main(int argc, char** argv)
         switches += (int)an.switches.size();
         loops += (int)an.backBranches.size();
         spins += (int)an.spinLoops.size();
-        loops += (int)an.backBranches.size();
-        spins += (int)an.spinLoops.size();
         for (const auto& [at, ea] : an.knownEa)
         {
             mmioSites += (ea >> 24) == 0xCC;

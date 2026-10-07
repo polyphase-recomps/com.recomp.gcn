@@ -29,9 +29,15 @@ constexpr const char* kDecompOption = "gcn.decompDir";
 //   "decomp"  Native/build.ps1: the decomp compiled to portable C (every platform)
 //   "recomp"  Runtime/tools/recomp/build_recomp.ps1: the disc's code recompiled (Windows x64),
 //             for packages with a Recomp/ folder
+//   "live"    build_recomp.ps1 -Live: no game code in the build, recompiled from the disc when
+//             the game starts (Windows x64)
 constexpr const char* kModeOption = "gcn.buildMode";
+// build profile setting: "0" leaves the disc unpacked into the project (Assets/Recomp/<game>/Disc)
+// out of the package: the packaged game asks the player for their disc (launcher scene)
+constexpr const char* kPackageDiscOption = "gcn.packageDisc";
 
 void SetBuildMode(const char* mode);
+void SetPackageDisc(bool package);
 
 bool SetupAll(const char* decompDir);
 void SetupAllAsync(const char* decompDir);

@@ -68,8 +68,13 @@ packaged for. Add a `GcnPlayer` node to a scene and set **Game** to the game pac
 
 **Recomp mode** (Windows x64): a game package with a `Recomp/` folder can instead run
 recompiled from the machine code on your own disc (Build mode **Recomp** in the GCN Recomp
-Target Options, or `Runtime/tools/recomp/build_recomp.ps1`). Its disc is unpacked into the
-project's `Assets/Recomp/<name>/Disc`. See [Docs/Recomp.md](Docs/Recomp.md).
+Target Options, or `Runtime/tools/recomp/build_recomp.ps1`), ahead of time or, with **Recomp
+Live**, when the game starts (no game code in the build). Its disc is unpacked into the
+project's `Assets/Recomp/<name>/Disc`; mods work in both. See [Docs/Recomp.md](Docs/Recomp.md).
+
+**Launcher**: every game is a com.recomp.mod.base launcher (`GcnLauncher`): a launcher scene
+(Tools > Recomp > Mods > Launcher) lets the player pick their own disc, checks it (game ID,
+revision, the executable's SHA-1 for recomp builds) and starts the game.
 
 ### Controls (default)
 

@@ -7,7 +7,8 @@
  *     void mod_<file name>_init(void)
  *
  * which runs once before the game's main(), and uses the calls below to hook frames and
- * to talk to Polyphase scripts (Lua table `Gcn`):
+ * to talk to Polyphase scripts (Lua table `Gcn`). The recomp builds compile the same mods
+ * into their HLE module, with GCN_RECOMP defined to 1 (Docs/Modding.md):
  *
  *   - variables: named views of game memory scripts read and write by name
  *     (Gcn.Read("lives"), Gcn.Write("lives", 9)); every global of the decomp is reachable

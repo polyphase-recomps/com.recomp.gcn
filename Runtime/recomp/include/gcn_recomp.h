@@ -78,6 +78,11 @@ typedef struct gcnr_ctx
 } gcnr_ctx;
 
 typedef void (*gcnr_func)(uint8_t* mem, gcnr_ctx* c);
+typedef struct gcnr_named_func
+{
+    const char* name;
+    gcnr_func fn;
+} gcnr_named_func;
 
 /* the graphics quantisation registers: one set for every guest thread (the runtime's threads
  * don't save them per thread, nor does the decomp build) */

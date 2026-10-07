@@ -109,6 +109,16 @@ const GcnwModule *gcnw_find_module(const char *package)
     return NULL;
 }
 
+int gcnw_module_count(void)
+{
+    return sModuleCount;
+}
+
+const GcnwModule *gcnw_module_at(int index)
+{
+    return index >= 0 && index < sModuleCount ? sModules[index] : NULL;
+}
+
 /* ---- the running instance ----------------------------------------------------------------- */
 static const GcnwModule *sModule;
 static struct w2c_env sEnv;

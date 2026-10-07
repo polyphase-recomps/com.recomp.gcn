@@ -72,6 +72,27 @@ make a patch with `Runtime/tools/gcn_mkpatch.py` into the game package's `Native
 (applied to copies at build time; the decomp checkout stays untouched). Wrap port-only
 code in `#ifdef PORT`.
 
+### Mods in recomp builds
+
+The same `Native/mods/*.c` run in the recomp builds (Build mode Recomp and Recomp Live, see
+[Recomp.md](Recomp.md)), unchanged: they are compiled into the HLE module (the runtime's SDK
+replacement) instead of the game, and `GCN_RECOMP` is 1 there (`#if GCN_RECOMP` for the rare
+difference). What makes that work:
+
+- **Game globals** a mod names (`extern f32 timeDelta;`) are stand-ins of the game's exact size,
+  placed at the game's own address (`gcn_hle_place.py`), so the mod reads and writes the variable
+  the recompiled code uses. The addresses come from the decomp's `symbols.txt`, or, for names it
+  calls `lbl_*`, from the package's `Recomp/syms.txt` `data` lines (`gcn_syms.py --placed`, the
+  decomp build's placed symbols). A global that can't be placed fails the build.
+- **Game functions** a mod calls become imports that call the recompiled code with the PowerPC
+  calling convention (integers, floating point and 64-bit values; at most 8 + 8 register
+  arguments).
+- Frame hooks, requests, events and overlay text run in the runtime's PADRead / frame start, as
+  in the decomp build; `Gcn.Read("anyGlobal")` and mod settings find every global of the game by
+  its name.
+
+Patches (`Native/patches/`) change the decomp's source, so they only affect the decomp build.
+
 ## Lua: the `Gcn` table
 
 | Function | Returns |

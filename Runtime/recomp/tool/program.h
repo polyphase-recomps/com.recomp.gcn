@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <istream>
 #include <map>
 #include <set>
 #include <string>
@@ -42,10 +43,17 @@ struct Program
 
     bool load_dol(const std::string& path, std::string& error);
     bool load_symbols(const std::string& path, std::string& error);
+    // the same from memory (Live builds: the DOL read from the disc, the symbols built in);
+    // `path` only names them in errors
+    bool load_dol_data(std::vector<uint8_t> data, const std::string& path, std::string& error);
+    bool load_symbols_text(const std::string& text, const std::string& path, std::string& error);
 
     bool in_text(uint32_t addr) const;
     bool read32(uint32_t addr, uint32_t& out) const; // big-endian word from any DOL section
     const Function* function_at(uint32_t addr) const;       // the function starting there
     const Function* function_containing(uint32_t addr) const; // the (non-extra) function covering it
+
+private:
+    bool load_symbols_from(std::istream& in, const std::string& path, std::string& error);
 };
 } // namespace gcnr

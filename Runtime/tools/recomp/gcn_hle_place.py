@@ -10,7 +10,10 @@ symbols.txt (unique global names only), retargets the relocations that reach it,
 gcn_hle_place_table (Runtime/recomp/hle_raw/hle_entry.c) so the initial contents are copied
 over the DOL's data at boot.
 
-    gcn_hle_place.py <hle.wasm> <hle.map> <symbols.txt>
+    gcn_hle_place.py <hle.wasm> <hle.map> <symbols.txt> [<recompiler syms.txt>]
+
+The recompiler's syms.txt adds the decomp's own names of the game's globals (its `data` lines,
+gcn_syms.py --placed), which the game package's mods use; symbols.txt names many of them lbl_*.
 
 Reuses gcn_place.py's wasm reader. Writes <hle>.syms (address 0 size name) like gcn_place.py.
 """
@@ -26,15 +29,23 @@ PLACEABLE = ('runtime_', 'gen_hle_data')  # object stems whose globals may move
 
 
 def main():
-    if len(sys.argv) != 4:
+    if len(sys.argv) not in (4, 5):
         print(__doc__)
         return 2
-    wasm_path, map_path, symbols_path = sys.argv[1:]
+    wasm_path, map_path, symbols_path = sys.argv[1:4]
     w = gp.Wasm(open(wasm_path, 'rb').read())
     by_name, _ = gp.read_symbols(symbols_path)
+    # the decomp's names (statics too): only for stand-ins, never to move the runtime's own globals
+    decomp_names = {}
+    if len(sys.argv) == 5:
+        for line in open(sys.argv[4], encoding='utf-8'):
+            f = line.split()
+            if len(f) == 4 and f[0] == 'data':
+                decomp_names[f[3]] = [(int(f[1], 16), int(f[2], 16), False, '.data')]
     objects = gp.read_map_objects(map_path)
 
     placed, taken, skipped = {}, [], []
+    standins = set()  # the game's own variables (gen/hle_data_stubs.c): never copied over the DOL's data
 
     def free(a, n):
         j = bisect.bisect_left(taken, (a, a + n))
@@ -49,6 +60,8 @@ def main():
         if not obj or not obj.startswith(PLACEABLE):
             continue
         cands = [c for c in by_name.get(name, []) if not c[2]]  # global symbols of that name
+        if not cands and obj.startswith('gen_hle_data'):
+            cands = decomp_names.get(name, [])
         if len(cands) != 1:
             continue
         a, osize = cands[0][0], cands[0][1]
@@ -60,6 +73,8 @@ def main():
             continue
         bisect.insort(taken, (a, a + size))
         placed[idx] = a
+        if obj.startswith('gen_hle_data'):
+            standins.add(idx)
 
     fixed = 0
     for target, t, off, idx, addend in w.relocs:
@@ -86,8 +101,8 @@ def main():
     entries = []
     for idx, a in sorted(placed.items(), key=lambda x: x[1]):
         _, _, name, addr, size = w.symbols[idx]
-        if w.data_bytes(addr, size) is None:
-            continue  # bss: the DOL's bss is zeroed at boot
+        if idx in standins or w.data_bytes(addr, size) is None:
+            continue  # the game's own data, or bss (the DOL's bss is zeroed at boot)
         entries.append([a, addr, size])
     cap = (tsize // 4 - 4) // 3
     assert len(entries) <= cap, 'gcn_hle_place_table holds %d entries, %d needed' % (cap, len(entries))

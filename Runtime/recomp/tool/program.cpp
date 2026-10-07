@@ -42,7 +42,14 @@ bool Program::load_dol(const std::string& path, std::string& error)
         error = "cannot open " + path;
         return false;
     }
-    dol.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    return load_dol_data(std::move(data), path, error);
+}
+
+bool Program::load_dol_data(std::vector<uint8_t> data, const std::string& path, std::string& error)
+{
+    dol = std::move(data);
+    sections.clear();
     if (dol.size() < 0x100)
     {
         error = path + " is not a DOL";
@@ -78,6 +85,17 @@ bool Program::load_symbols(const std::string& path, std::string& error)
         error = "cannot open " + path;
         return false;
     }
+    return load_symbols_from(in, path, error);
+}
+
+bool Program::load_symbols_text(const std::string& text, const std::string& path, std::string& error)
+{
+    std::istringstream in(text);
+    return load_symbols_from(in, path, error);
+}
+
+bool Program::load_symbols_from(std::istream& in, const std::string& path, std::string& error)
+{
     std::set<std::string> hleNames;
     std::string line;
     int lineNo = 0;
