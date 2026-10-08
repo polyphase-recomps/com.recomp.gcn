@@ -27,6 +27,8 @@ struct Function
     std::string name; // symbol name ("" for extra entries)
     bool hle = false; // supplied by the runtime: never recompiled, calls go to hle_<name>
     bool extra = false; // an entry point inside another function (runs to that function's end)
+    bool stub = false;  // `stub` line: returns stubValue in r3 instead of running (hardware the runtime lacks)
+    uint32_t stubValue = 0;
 
     std::string c_name() const; // f_80003140 / hle_OSReport
 };

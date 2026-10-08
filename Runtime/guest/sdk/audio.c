@@ -239,6 +239,14 @@ void DSPHalt(void) {}
 void DSPReset(void) {}
 u32 DSPGetDMAStatus(void) { return 0; }
 
+/* GCN_DSP_MUSYX (default 1): the DSP program is MusyX's. A game whose sound is AX (its own
+ * microcode, the same 0xBABE frame mails, other commands: F-Zero GX) sets it to 0 in its
+ * gcn_game.json "defines": frames are acknowledged without being run (no sound, and no MusyX
+ * reading of AX command lists, whose output addresses it would write to). */
+#ifndef GCN_DSP_MUSYX
+#define GCN_DSP_MUSYX 1
+#endif
+
 void DSPSendMailToDSP(u32 mail)
 {
     if (!sMailHeader)
@@ -247,7 +255,9 @@ void DSPSendMailToDSP(u32 mail)
         return;
     }
     sMailHeader = 0;
+#if GCN_DSP_MUSYX
     gcn_musyx_dsp_frame((const u16 *)mail);
+#endif
     sResumePending = sTasks;
 }
 

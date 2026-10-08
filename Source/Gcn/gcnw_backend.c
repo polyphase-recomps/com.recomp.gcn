@@ -502,11 +502,31 @@ u64 w2c_env_gcn_host_ticks(struct w2c_env *env)
     return us * 405 / 10;
 }
 
+/* GCN_WATCH_DMA=<hex address> (debugging): log the emulated DMAs (disc, ARAM, memory card)
+ * that write over that address - the recompiler's store watch (GCNR_WATCH) sees only the CPU */
+static void dma_watch(const char *what, u32 dst, u32 size, u32 from)
+{
+    static int init;
+    static u32 watch;
+    if (!init)
+    {
+        const char *e = getenv("GCN_WATCH_DMA");
+        init = 1;
+        watch = e ? (u32)strtoul(e, NULL, 16) & 0x01FFFFFFu : 0xFFFFFFFFu;
+    }
+    if (watch != 0xFFFFFFFFu && GCNW_OFFSET(dst) <= watch && watch < GCNW_OFFSET(dst) + size)
+    {
+        host_log("dma watch: %s of %X bytes to %08X (from %08X) covers %08X", what, (unsigned)size, (unsigned)dst,
+                 (unsigned)from, (unsigned)watch);
+    }
+}
+
 u32 w2c_env_gcn_host_disc_read(struct w2c_env *env, u32 dst, u32 offset, u32 size)
 {
     /* the drive DMAs into memory: written behind the CPU cache, so the GPU sees it */
     uint8_t *p = guest_ptr(dst, size);
     u32 got;
+    dma_watch("disc read", dst, size, offset);
     PROF_BEGIN();
     got = gcnp_disc_read(p, offset, size);
     gcnw_dcache_flush(p, got);
@@ -609,6 +629,7 @@ void w2c_env_gcn_host_dcache(struct w2c_env *env, u32 op, u32 addr, u32 bytes)
 
 u32 w2c_env_gcn_host_card_io(struct w2c_env *env, u32 chan, u32 buf, u32 offset, u32 size, u32 write)
 {
+    if (!write) dma_watch("memory card read", buf, size, offset);
     return gcnp_card_io((int)chan, guest_ptr(buf, size), offset, size, (int)write);
 }
 
@@ -641,6 +662,7 @@ void w2c_env_gcn_host_aram(struct w2c_env *env, u32 dir, u32 ram, u32 aram, u32 
     }
     else
     {
+        dma_watch("ARAM to RAM", ram, bytes, aram);
         memcpy(guest_ptr(ram, bytes), sAram + aram, bytes);
         gcnw_dcache_flush(guest_ptr(ram, bytes), bytes); /* a DMA on the console */
     }

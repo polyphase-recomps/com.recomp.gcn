@@ -136,6 +136,12 @@ gcnr_func gcnr_lookup(uint32_t addr)
     return f->fn;
 }
 
+/* the table changed (Live builds: a module linked or unlinked) */
+void gcnr_lookup_reset(void)
+{
+    memset(sCache, 0, sizeof(sCache));
+}
+
 gcnr_func gcnr_lookup_from(uint32_t addr, const gcnr_ctx* c)
 {
     const uint32_t a = 0x80000000u | (addr & 0x01FFFFFFu);
@@ -157,6 +163,7 @@ gcnr_func gcnr_lookup_from(uint32_t addr, const gcnr_ctx* c)
 
 /* ---- store watchpoint (GCNR_WATCH builds, GCNR_WATCH=<hex address>) ------------------------- */
 uint32_t gcnr_watch_addr = 0xFFFFFFFFu;
+uint32_t gcnr_watch_pc; /* Live builds: the guest instruction gcnl_exec runs */
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -169,7 +176,8 @@ void gcnr_watch_hit(uint32_t addr, uint64_t value, int bytes)
 {
     static int sCount;
     if (sCount++ > 64) return;
-    logf_("recomp watch: %d-byte store to %08X: %llX", bytes, addr, (unsigned long long)value);
+    logf_("recomp watch: %d-byte store to %08X: %llX (guest pc %08X)", bytes, addr, (unsigned long long)value,
+          gcnr_watch_pc);
 #if defined(_WIN32)
     {
         void* frames[12];

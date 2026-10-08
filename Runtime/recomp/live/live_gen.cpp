@@ -86,14 +86,28 @@ bool uncond_branch(const Insn& i)
 class LiveGen
 {
 public:
-    LiveGen(Program& p, const gcnr_named_func* hle, LiveResult& out) : P(p), mOut(out)
+    LiveGen(Program& p, const LiveInputs& in, LiveResult& out) : P(p), mIn(in), mOut(out)
     {
-        for (const gcnr_named_func* h = hle; h && h->name; h++)
+        for (const gcnr_named_func* h = in.hle; h && h->name; h++)
         {
             mHleByName[h->name] = h->fn;
         }
         const char* env = std::getenv("GCNL_NO_INLINE");
         mInline = !(env && env[0] == '1');
+        // a store watch (GCNR_WATCH=<hex> in a GCNR_WATCH build): stores through gcnr_sw & co
+        mInlineStores = std::getenv("GCNR_WATCH") == nullptr;
+        // GCNL_TRACE=<hex>,<hex>...: those functions log their registers on entry (GcnRecomp --trace)
+        if (const char* t = std::getenv("GCNL_TRACE"))
+        {
+            for (const char* p = t; *p;)
+            {
+                char* end = nullptr;
+                const unsigned long v = std::strtoul(p, &end, 16);
+                if (end == p) break;
+                mTraced.insert((uint32_t)v);
+                p = *end ? end + 1 : end;
+            }
+        }
     }
 
     bool run();
@@ -140,8 +154,11 @@ private:
 
     sljit_compiler* C = nullptr;
     Program& P;
+    LiveInputs mIn;
     LiveResult& mOut;
     bool mInline = true;
+    bool mInlineStores = true;
+    std::set<uint32_t> mTraced;
     std::map<std::string, gcnr_func> mHleByName;
     std::map<uint32_t, sljit_label*> mEntry; // f_ADDR
     std::map<uint32_t, sljit_label*> mBody;  // <f>_body of LR-mode functions
@@ -157,14 +174,24 @@ private:
 void LiveGen::call_target(uint32_t target)
 {
     const Function* f = P.function_at(target);
+    gcnr_func ext = nullptr;
+    if (f == nullptr && mIn.external)
+    {
+        ext = mIn.external(target);
+    }
     args_mem_ctx();
     if (f != nullptr && f->hle)
     {
         sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2V(P, P), IMM, SLJIT_FUNC_ADDR(mHleByName[f->name]));
     }
-    else if (f != nullptr)
+    else if (f != nullptr && !mIn.hooked.count(target))
     {
         mCalls.push_back({sljit_emit_call(C, SLJIT_CALL, SLJIT_ARGS2V(P, P)), target});
+    }
+    else if (ext != nullptr)
+    {
+        // compiled before (the DOL, a module linked earlier; a hooked function's wrapper)
+        sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2V(P, P), IMM, SLJIT_FUNC_ADDR(ext));
     }
     else
     {
@@ -609,7 +636,7 @@ bool LiveGen::inline_op(const Insn& i, uint32_t hw)
     case Op::Sth: case Op::Sthu: case Op::Sthx: case Op::Sthux:
     case Op::Stw: case Op::Stwu: case Op::Stwx: case Op::Stwux:
     {
-        if (hw) return false;
+        if (hw || !mInlineStores) return false;
         const bool x = i.op == Op::Stbx || i.op == Op::Stbux || i.op == Op::Sthx || i.op == Op::Sthux ||
                        i.op == Op::Stwx || i.op == Op::Stwux;
         const bool u = i.op == Op::Stbu || i.op == Op::Stbux || i.op == Op::Sthu || i.op == Op::Sthux ||
@@ -649,7 +676,7 @@ bool LiveGen::inline_op(const Insn& i, uint32_t hw)
     case Op::Stfs: case Op::Stfsu: case Op::Stfsx: case Op::Stfsux:
     case Op::Stfd: case Op::Stfdu: case Op::Stfdx: case Op::Stfdux:
     {
-        if (hw) return false;
+        if (hw || !mInlineStores) return false;
         const bool x = i.op == Op::Stfsx || i.op == Op::Stfsux || i.op == Op::Stfdx || i.op == Op::Stfdux;
         const bool u = i.op == Op::Stfsu || i.op == Op::Stfsux || i.op == Op::Stfdu || i.op == Op::Stfdux;
         const bool single = i.op == Op::Stfs || i.op == Op::Stfsu || i.op == Op::Stfsx || i.op == Op::Stfsux;
@@ -811,6 +838,36 @@ void LiveGen::insn(const Analysis& an, const Insn& i)
 {
     const uint32_t next = i.addr + 4;
     std::vector<sljit_jump*> no;
+    if (mIn.dynamic.count(i.addr))
+    {
+        // relocated against another module: OSLink / OSUnlink of that module rewrite it, so it is
+        // decoded when it runs
+        sljit_emit_op1(C, SLJIT_MOV_P, R0, 0, MEM, 0);
+        sljit_emit_op1(C, SLJIT_MOV_P, R1, 0, CTX, 0);
+        sljit_emit_op1(C, SLJIT_MOV32, R2, 0, IMM, I32(i.addr));
+        if (i.op == Op::B)
+        {
+            if (i.lk)
+            {
+                sljit_emit_op1(C, SLJIT_MOV32, CM, OFF(lr), IMM, I32(next));
+            }
+            sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32), IMM, SLJIT_FUNC_ADDR(gcnl_call_insn));
+            if (!i.lk)
+            {
+                ret();
+            }
+        }
+        else if (gekko::is_branch(i.op))
+        {
+            unhandled(i.addr, "conditional branch relocated against another module");
+        }
+        else
+        {
+            sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32), IMM, SLJIT_FUNC_ADDR(gcnl_exec_at));
+        }
+        mOut.helpers++;
+        return;
+    }
     switch (i.op)
     {
     case Op::B:
@@ -1002,6 +1059,13 @@ void LiveGen::function(const Function& f)
         mEntry[f.addr] = sljit_emit_label(C);
         sljit_emit_enter(C, 0, SLJIT_ARGS2V(P, P), 4 | SLJIT_ENTER_FLOAT(3), 2, 16);
     }
+    if (mTraced.count(f.addr))
+    {
+        sljit_emit_op1(C, SLJIT_MOV32, R0, 0, IMM, I32(f.addr));
+        sljit_emit_op1(C, SLJIT_MOV_P, R1, 0, MEM, 0);
+        sljit_emit_op1(C, SLJIT_MOV_P, R2, 0, CTX, 0);
+        sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(32, P, P), IMM, SLJIT_FUNC_ADDR(gcnr_trace_func));
+    }
     bool endsInBranch = false;
     for (const Insn& i : an.insns)
     {
@@ -1073,6 +1137,15 @@ bool LiveGen::run()
                 mOut.error = "live: no HLE wrapper hle_" + f.name + " (the HLE module and syms.txt disagree)";
                 break;
             }
+            continue;
+        }
+        if (f.stub)
+        {
+            // syms.txt `stub`: hardware the runtime does not have (returns the value in r3)
+            mEntry[f.addr] = sljit_emit_label(C);
+            sljit_emit_enter(C, 0, SLJIT_ARGS2V(P, P), 4, 2, 0);
+            sljit_emit_op1(C, SLJIT_MOV32, CM, OR_(3), IMM, I32(f.stubValue));
+            ret();
             continue;
         }
         if (f.extra)
@@ -1149,13 +1222,31 @@ bool LiveGen::run()
 }
 } // namespace
 
-LiveResult live_recompile(Program& program, const gcnr_named_func* hle)
+namespace
+{
+// the code and gcnl_exec's arguments (in the generator) live as long as the result
+struct Owner
+{
+    std::unique_ptr<LiveGen> gen;
+    void* code = nullptr;
+    ~Owner()
+    {
+        if (code != nullptr)
+        {
+            sljit_free_code(code, nullptr);
+        }
+    }
+};
+} // namespace
+
+LiveResult live_recompile(Program& program, const LiveInputs& inputs)
 {
     LiveResult out;
-    // gcnl_exec's arguments live as long as the code: the generator (and its deque) stays
-    static std::deque<std::unique_ptr<LiveGen>> keep;
-    keep.push_back(std::make_unique<LiveGen>(program, hle, out));
-    keep.back()->run();
+    auto owner = std::make_shared<Owner>();
+    owner->gen = std::make_unique<LiveGen>(program, inputs, out);
+    owner->gen->run();
+    owner->code = out.code;
+    out.owner = owner;
     return out;
 }
 } // namespace gcnr

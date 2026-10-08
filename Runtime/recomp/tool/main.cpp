@@ -99,7 +99,7 @@ int main(int argc, char** argv)
                         "const gcnr_function gcnr_functions[] = {\n";
     std::string body, lrStubs;
     int lrFunctions = 0;
-    int fileIndex = 0, inFile = 0, recompiled = 0, hle = 0, switches = 0, mmioSites = 0, loops = 0, spins = 0;
+    int fileIndex = 0, inFile = 0, recompiled = 0, hle = 0, stubs = 0, switches = 0, mmioSites = 0, loops = 0, spins = 0;
     size_t instructions = 0;
     auto flush = [&](bool force) {
         if (inFile == 0 || (!force && inFile < perFile))
@@ -124,6 +124,18 @@ int main(int argc, char** argv)
         if (f.hle)
         {
             hle++;
+            continue;
+        }
+        if (f.stub)
+        {
+            // syms.txt `stub`: hardware the runtime does not have (returns the value in r3)
+            char stub[160];
+            std::snprintf(stub, sizeof(stub), "void %s(uint8_t* mem, gcnr_ctx* c)\n{\n    (void)mem;\n    c->r[3] = 0x%Xu;\n}\n\n",
+                          f.c_name().c_str(), f.stubValue);
+            body += "/* " + (f.name.empty() ? f.c_name() : f.name) + ": stub */\n" + stub;
+            stubs++;
+            inFile++;
+            flush(false);
             continue;
         }
         // an entry point inside an LR-mode function enters that function's body
@@ -184,10 +196,10 @@ int main(int argc, char** argv)
 
     std::string report;
     std::snprintf(buf, sizeof(buf),
-                  "functions: %d recompiled (%d extra entry points), %d HLE\ninstructions: %zu\n"
+                  "functions: %d recompiled (%d extra entry points), %d HLE, %d stubs\ninstructions: %zu\n"
                   "jump tables: %d\nloops: %d (%d busy-wait: no stores, no calls)\nhardware register accesses found: %d\n"
                   "warnings: %zu\n\n",
-                  recompiled, extras, hle, instructions, switches, loops, spins, mmioSites, warnings.size());
+                  recompiled, extras, hle, stubs, instructions, switches, loops, spins, mmioSites, warnings.size());
     report += buf;
     for (const std::string& w : warnings)
     {

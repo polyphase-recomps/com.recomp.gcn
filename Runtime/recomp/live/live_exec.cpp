@@ -127,11 +127,32 @@ void gcnl_sw(uint8_t* mem, uint32_t a, uint32_t v) { gcnr_sw(mem, a, v); }
 void gcnl_sh(uint8_t* mem, uint32_t a, uint32_t v) { gcnr_sh(mem, a, v); }
 void gcnl_sb(uint8_t* mem, uint32_t a, uint32_t v) { gcnr_sb(mem, a, v); }
 void gcnl_sd(uint8_t* mem, uint32_t a, uint64_t v) { gcnr_sd(mem, a, v); }
+
+// code another module's link rewrites (live_gen.cpp: LiveInputs::dynamic)
+void gcnl_exec_at(uint8_t* mem, gcnr_ctx* c, uint32_t addr)
+{
+    gcnl_insn li;
+    li.i = gekko::decode(gcnr_lw(mem, addr), addr);
+    gcnl_exec(mem, c, &li);
 }
+
+void gcnl_call_insn(uint8_t* mem, gcnr_ctx* c, uint32_t addr)
+{
+    const gekko::Insn i = gekko::decode(gcnr_lw(mem, addr), addr);
+    GCNR_CALL_INDIRECT(mem, c, i.target);
+}
+}
+
+#if GCNR_WATCH
+extern "C" uint32_t gcnr_watch_pc; // recomp_gcn.c: the guest instruction a watch hit reports
+#endif
 
 extern "C" void gcnl_exec(uint8_t* mem, gcnr_ctx* c, const gcnl_insn* li)
 {
     const Insn& i = li->i;
+#if GCNR_WATCH
+    gcnr_watch_pc = i.addr;
+#endif
     const int d = i.d, a = i.a, b = i.b, cc = i.c;
     uint32_t* r = c->r;
     gcnr_fpr* f = c->f;

@@ -65,7 +65,10 @@ class HleBuild(gcn_build.Build):
         units = []
         for f in sorted(gcn_build.glob.glob(os.path.join(RUNTIME, 'guest', '**', '*.c'), recursive=True)):
             rel = os.path.relpath(f, os.path.join(RUNTIME, 'guest')).replace('\\', '/')
-            if rel.split('/')[0] in self.cfg.get('runtime_exclude', []):
+            # "runtime_exclude": folders or files of Runtime/guest a game does without (e.g.
+            # "sdk/axfx_reverb.c", MusyX's reverb, in a game whose sound is AX)
+            excl = self.cfg.get('runtime_exclude', [])
+            if rel.split('/')[0] in excl or rel in excl:
                 continue
             units.append(gcn_build.Unit('runtime/' + rel, f, f, 'runtime'))
         # the game package's mods (Native/mods/*.c), as in the decomp build: they reach the game's
@@ -166,6 +169,9 @@ def main():
         f = l.split()
         if len(f) == 4 and f[0] == 'data' and f[3] not in dtk:
             dtk[f[3]] = ('object', int(f[1], 16), int(f[2], 16))
+        # functions syms.txt names that symbols.txt does not (gcn_sdkmatch.py, a package's names.txt)
+        elif len(f) == 4 and f[0] == 'func' and f[3] not in dtk:
+            dtk[f[3]] = ('function', int(f[1], 16), int(f[2], 16))
     hle = [l.split()[1] for l in open(a.syms) if l.startswith('hle ')]
 
     # (no extract step: the runtime sources include nothing the decomp extracts from the disc)

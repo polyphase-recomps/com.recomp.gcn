@@ -23,6 +23,9 @@
 #include "../tool/gekko.h"
 #include "../tool/program.h"
 
+#include <functional>
+#include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -35,6 +38,10 @@ struct gcnl_insn
 };
 
 extern "C" void gcnl_exec(uint8_t* mem, gcnr_ctx* c, const gcnl_insn* li);
+// the instruction at addr, decoded when it runs (code another module's link rewrites)
+extern "C" void gcnl_exec_at(uint8_t* mem, gcnr_ctx* c, uint32_t addr);
+// the call the b / bl at addr makes now (its target rewritten by OSLink / OSUnlink)
+extern "C" void gcnl_call_insn(uint8_t* mem, gcnr_ctx* c, uint32_t addr);
 
 namespace gcnr
 {
@@ -44,10 +51,21 @@ struct LiveFunction
     gcnr_func fn = nullptr;
 };
 
+struct LiveInputs
+{
+    const gcnr_named_func* hle = nullptr; // the HLE wrappers by name (gen_hle_glue.py's gcnr_hle_functions)
+    // code compiled before (the DOL, modules linked earlier): a call there is direct; nullptr: unknown
+    // (the call goes through the lookup when it happens)
+    std::function<gcnr_func(uint32_t)> external;
+    std::set<uint32_t> hooked;  // functions whose calls go through the lookup (recomp_live.cpp wraps them)
+    std::set<uint32_t> dynamic; // instructions another module's link rewrites: decoded when they run
+};
+
 struct LiveResult
 {
     std::vector<LiveFunction> functions; // sorted by address (recompiled and HLE alike)
-    void* code = nullptr;                // the sljit code block (kept for the process)
+    void* code = nullptr;                // the sljit code block
+    std::shared_ptr<void> owner;         // the code and what it refers to: freed with the last copy
     size_t codeSize = 0;
     size_t instructions = 0;
     size_t inlined = 0;   // instructions emitted as native code
@@ -57,7 +75,6 @@ struct LiveResult
     std::string error;    // set when it failed
 };
 
-// hle: the HLE wrappers by name (gen_hle_glue.py's gcnr_hle_functions)
-LiveResult live_recompile(Program& program, const gcnr_named_func* hle);
+LiveResult live_recompile(Program& program, const LiveInputs& inputs);
 } // namespace gcnr
 #endif

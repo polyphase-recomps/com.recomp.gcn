@@ -1368,6 +1368,77 @@ static void fifo_write(uint32_t value, int bytes)
     }
 }
 
+/* ---- multi-buffered FIFOs --------------------------------------------------------------------------
+ * GXSetCPUFifo and GXSetGPFifo on different buffers, not linked (F-Zero GX): the CPU writes a
+ * frame's commands to memory (fifo_to_memory, as for a display list) while the GPU reads another
+ * buffer; the game hands a filled buffer over with GXSetGPFifo (CP base / end / read / write
+ * pointers, then the read enable). Then the commands between the read and write pointers run,
+ * at once, as the pipe's do, and the read pointer catches up. */
+static uint32_t cp32(uint32_t off)
+{
+    return (((uint32_t)sCpRegs[(off + 2) >> 1] << 16) | sCpRegs[off >> 1]) & 0x03FFFFFF;
+}
+
+static void feed(const uint8_t *p, uint32_t n)
+{
+    while (n)
+    {
+        uint32_t take = n < 4096 ? n : 4096;
+        if (sFifoLen + take > FIFO_SIZE) take = FIFO_SIZE - sFifoLen;
+        memcpy(sFifo + sFifoLen, p, take);
+        sFifoLen += take;
+        p += take;
+        n -= take;
+        sStats.fifo_bytes += take;
+        if (sFifoLen >= sFifoNeed)
+        {
+            uint32_t used;
+            sFifoNeed = 0;
+            used = parse(sFifo, sFifoLen, 0);
+            if (used)
+            {
+                memmove(sFifo, sFifo + used, sFifoLen - used);
+                sFifoLen -= used;
+            }
+        }
+        if (sFifoLen > FIFO_SIZE - 64)
+        {
+            sFifoLen = 0; /* desynchronised: start over */
+            sFifoNeed = 0;
+        }
+    }
+}
+
+static void gp_fifo_run(void)
+{
+#if !GCN_GPU_PASSTHROUGH
+    uint32_t base, end, rd, wr;
+    static int sRunning;
+
+    if (sRunning || !(sCpRegs[1] & 1) || (sCpRegs[1] & 0x10)) return; /* read off, or linked: immediate */
+    base = cp32(0x20);
+    end = cp32(0x24) + 4; /* the CP's end register: the FIFO's last word */
+    wr = cp32(0x34);
+    rd = cp32(0x38);
+    if (rd == wr || end <= base || rd < base || rd >= end || wr < base || wr > end) return;
+    sRunning = 1;
+    sGatherLen = 0;
+    if (rd < wr)
+    {
+        feed(guest(rd), wr - rd);
+    }
+    else
+    {
+        feed(guest(rd), end - rd);
+        feed(guest(base), wr - base);
+    }
+    sCpRegs[0x38 >> 1] = (uint16_t)wr;
+    sCpRegs[0x3A >> 1] = (uint16_t)(wr >> 16);
+    sCpRegs[0x30 >> 1] = sCpRegs[0x32 >> 1] = 0; /* read-write distance: empty */
+    sRunning = 0;
+#endif
+}
+
 /* ---- MMIO -------------------------------------------------------------------------------------- */
 uint32_t gcn_gpu_reg_read(uint32_t addr, int bytes)
 {
@@ -1422,6 +1493,8 @@ void gcn_gpu_reg_write(uint32_t addr, uint32_t value, int bytes)
                 sBreakpointHit = 0;
             }
         }
+        /* a buffer handed to the GPU (read enabled), or more of it (write pointer) */
+        if (off == 2 || off == 0x36) gp_fifo_run();
         break;
     case 0xCC001000:
         sPeRegs[(off >> 1) & 0x7F] = (uint16_t)value;

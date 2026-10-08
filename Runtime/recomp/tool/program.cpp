@@ -97,6 +97,7 @@ bool Program::load_symbols_text(const std::string& text, const std::string& path
 bool Program::load_symbols_from(std::istream& in, const std::string& path, std::string& error)
 {
     std::set<std::string> hleNames;
+    std::map<uint32_t, uint32_t> stubs;
     std::string line;
     int lineNo = 0;
     while (std::getline(in, line))
@@ -154,6 +155,12 @@ bool Program::load_symbols_from(std::istream& in, const std::string& path, std::
                 ss >> name;
                 hleNames.insert(name);
             }
+            else if (kind == "stub")
+            {
+                std::string a, v;
+                ss >> a >> v;
+                stubs[parse_u32(a)] = parse_u32(v);
+            }
         }
         catch (...)
         {
@@ -164,6 +171,12 @@ bool Program::load_symbols_from(std::istream& in, const std::string& path, std::
     for (auto& [addr, f] : functions)
     {
         f.hle = hleNames.count(f.name) != 0;
+        auto s = stubs.find(addr);
+        if (s != stubs.end() && !f.hle)
+        {
+            f.stub = true;
+            f.stubValue = s->second;
+        }
     }
     return true;
 }

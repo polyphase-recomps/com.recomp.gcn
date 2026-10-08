@@ -63,13 +63,28 @@ WEAK u32 OSGetPhysicalMemSize(void) { return 0x01800000; }
 WEAK u32 OSGetConsoleSimulatedMemSize(void) { return 0x01800000; }
 
 /* ---- time ------------------------------------------------------------------------------ */
-WEAK OSTime OSGetTime(void) { return (OSTime)gcn_host_ticks(); }
-WEAK OSTick OSGetTick(void) { return (OSTick)gcn_host_ticks(); }
+static BOOL sInterruptsEnabled = TRUE;
+
+/* GCN_POLL_ON_TIME (a game's gcn_game.json "defines"): reading the time delivers what is pending
+ * (interrupts, DVD, DSP), as the console would interrupt the code polling it: for games that wait
+ * on a flag an interrupt handler sets while watching the clock (F-Zero GX's draw-done wait),
+ * which no scheduling point or busy-wait check reaches. */
+#ifndef GCN_POLL_ON_TIME
+#define GCN_POLL_ON_TIME 0
+#endif
+static void time_poll(void)
+{
+#if GCN_POLL_ON_TIME
+    if (sInterruptsEnabled && sBooted) gcn_poll_events();
+#endif
+}
+
+WEAK OSTime OSGetTime(void) { time_poll(); return (OSTime)gcn_host_ticks(); }
+WEAK OSTick OSGetTick(void) { time_poll(); return (OSTick)gcn_host_ticks(); }
 
 WEAK OSTime __OSGetSystemTime(void) { return (OSTime)gcn_host_ticks(); }
 
 /* ---- interrupts: there are none to mask; events are delivered at scheduling points --- */
-static BOOL sInterruptsEnabled = TRUE;
 
 WEAK BOOL OSDisableInterrupts(void)
 {

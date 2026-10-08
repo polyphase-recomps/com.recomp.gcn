@@ -31,6 +31,7 @@ bss count (what gcn_place.py left at the linker's addresses is not the game's).
 """
 import argparse
 import hashlib
+import os
 import re
 import struct
 import sys
@@ -121,6 +122,72 @@ def hle_from_map(path, functions):
     return runtime - other
 
 
+# the runtime's library-level fallbacks: a game's own C library, matrix math and compiler helpers
+# win (they touch no hardware); its other WEAK definitions (OSInit, the arena, time, caches,
+# interrupts, console output, __sys_alloc...) are SDK replacements and replace the game's too
+LIBRARY_FALLBACKS = ("libc.c", "mtx.c", "intrinsics.c")
+
+
+def hle_from_runtime(map_path, src_dir, functions):
+    """Every function an HLE build's runtime_* objects define that the game has by name, minus
+    the runtime's library-level fallbacks (LIBRARY_FALLBACKS): a game without a decomp build
+    runs its own machine code for everything, so this is what the decomp build takes from the
+    runtime (whose SDK units the decomp builds exclude)."""
+    runtime = set()
+    with open(map_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = MAP_RE.search(line)
+            if m and m.group(1).startswith("runtime_"):
+                runtime.add(m.group(2))
+    weak = set()
+    if src_dir:
+        import glob
+        for path in glob.glob(os.path.join(src_dir, "**", "*.c"), recursive=True):
+            if os.path.basename(path) not in LIBRARY_FALLBACKS:
+                continue
+            text = open(path, encoding="utf-8", errors="replace").read()
+            weak |= set(re.findall(r"^WEAK\s+[\w\s\*]*?\b(\w+)\s*\(", text, re.M))
+    return (runtime - weak) & functions
+
+
+def write_modules(f, config_path):
+    """The REL modules of a dtk config.yml: per module (its id from dtk's fn_<id>_ / lbl_<id>_ names)
+        module <id> <name> <section names, in the order of the REL's non-empty sections>
+        mfunc <id> <section> <offset> <size> <name>
+        mlabel <id> <section> <offset> <name>
+        mtable <id> <section> <offset> <size>      sized data objects (switch tables)
+    Section-relative: modules are placed wherever the game links them."""
+    root = os.path.dirname(os.path.abspath(config_path))
+    while os.path.basename(root) != "config" and os.path.dirname(root) != root:
+        root = os.path.dirname(root)
+    root = os.path.dirname(root)
+    text = open(config_path, encoding="utf-8").read()
+    count = 0
+    for block in re.split(r"\n- ", text.split("\nmodules:", 1)[1] if "\nmodules:" in text else ""):
+        name = re.search(r"name:\s*(\S+)", block)
+        sym = re.search(r"symbols:\s*(\S+)", block)
+        spl = re.search(r"splits:\s*(\S+)", block)
+        if not (name and sym and spl):
+            continue
+        syms = read_symbols(os.path.join(root, sym.group(1)))
+        head = open(os.path.join(root, spl.group(1)), encoding="utf-8").read().split("\n\n")[0]
+        sections = re.findall(r"^\s+(\.\w+)", head, re.M)
+        ids = [int(m.group(1)) for s in syms for m in [re.match(r"^(?:fn|lbl)_(\d+)_", s["name"])] if m]
+        if not ids:
+            continue
+        mid = max(set(ids), key=ids.count)
+        f.write("module %d %s %s\n" % (mid, name.group(1), " ".join(sections)))
+        for s in sorted(syms, key=lambda s: (s["section"], s["addr"])):
+            if s["kind"] == "function" and s["size"]:
+                f.write("mfunc %d %s 0x%X 0x%X %s\n" % (mid, s["section"], s["addr"], s["size"], s["name"]))
+            elif s["kind"] == "label" and s["section"] == ".text":
+                f.write("mlabel %d %s 0x%X %s\n" % (mid, s["section"], s["addr"], s["name"]))
+            elif s["kind"] == "object" and s["size"] and s["section"] in (".data", ".rodata"):
+                f.write("mtable %d %s 0x%X 0x%X\n" % (mid, s["section"], s["addr"], s["size"]))
+        count += 1
+    return count
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbols", required=True)
@@ -130,12 +197,36 @@ def main():
     ap.add_argument("--hle", help="a saved HLE list (one name per line)")
     ap.add_argument("--write-hle", help="save the HLE list here")
     ap.add_argument("--placed", help="the decomp build's placed data symbols (gcn_place.py's <name>.syms)")
+    ap.add_argument("--names", action="append", default=[],
+                    help="'0xADDR name' lines naming functions the decomp leaves unnamed (gcn_sdkmatch.py's "
+                         "output, a package's hand-checked names.txt); 'stub 0xADDR value' lines make a function "
+                         "return value instead of running (hardware the runtime does not have)")
+    ap.add_argument("--runtime-map", help="an HLE build's link map (Runtime/tools/recomp/gcn_hle_build.py): without "
+                                          "a decomp build, the HLE set is every function the runtime defines, "
+                                          "except its weak fallbacks (--runtime-src), that the game has by name")
+    ap.add_argument("--runtime-src", help="com.recomp.gcn's Runtime/guest (its library-level WEAK definitions are "
+                                          "fallbacks the game's own code beats)")
+    ap.add_argument("--modules", help="the decomp's dtk config.yml: its REL modules' symbols too (`module` / `mfunc` / "
+                                      "`mlabel` / `mtable` lines, section-relative; a Live build recompiles each "
+                                      "module when the game links it)")
     args = ap.parse_args()
 
     dol = open(args.dol, "rb").read()
     text, entry = dol_sections(dol)
     syms = read_symbols(args.symbols)
     in_text = lambda a: any(base <= a < base + size for base, size, _ in text)
+    stubs = {}
+    for path in args.names:
+        rename = {}
+        for line in open(path, encoding="utf-8"):
+            f = line.split()
+            if len(f) >= 3 and f[0] == "stub":
+                stubs[int(f[1], 0)] = int(f[2], 0)
+            elif len(f) >= 2 and f[0].startswith("0x"):
+                rename[int(f[0], 0)] = f[1]
+        for s in syms:
+            if s["kind"] == "function" and s["addr"] in rename:
+                s["name"] = rename[s["addr"]]
 
     funcs = [s for s in syms if s["kind"] == "function" and in_text(s["addr"])]
     names = {s["name"] for s in funcs}
@@ -149,6 +240,8 @@ def main():
     hle = set()
     if args.map:
         hle = hle_from_map(args.map, names)
+    elif args.runtime_map:
+        hle = hle_from_runtime(args.runtime_map, args.runtime_src, names)
     elif args.hle:
         with open(args.hle) as f:
             hle = {l.strip() for l in f if l.strip() and not l.startswith("#")} & names
@@ -186,11 +279,15 @@ def main():
             f.write("jumptable 0x%08X 0x%X\n" % (s["addr"], s["size"]))
         for n in sorted(hle):
             f.write("hle %s\n" % n)
+        for addr in sorted(stubs):
+            f.write("stub 0x%08X 0x%X\n" % (addr, stubs[addr] & 0xFFFFFFFF))
         placed = read_placed(args.placed, dol_data_ranges(dol)) if args.placed else {}
         for n, (addr, size) in sorted(placed.items(), key=lambda x: (x[1][0], x[0])):
             f.write("data 0x%08X 0x%X %s\n" % (addr, size, n))
-    print("%d functions, %d labels, %d jump tables, %d HLE, %d data, r2=%s r13=%s" %
-          (len(funcs), len(labels), len(tables), len(hle), len(placed), hex(bases.get(2, 0)), hex(bases.get(13, 0))))
+        modules = write_modules(f, args.modules) if args.modules else 0
+    print("%d functions, %d labels, %d jump tables, %d HLE, %d data, %d modules, r2=%s r13=%s" %
+          (len(funcs), len(labels), len(tables), len(hle), len(placed), modules, hex(bases.get(2, 0)),
+           hex(bases.get(13, 0))))
     return 0
 
 
