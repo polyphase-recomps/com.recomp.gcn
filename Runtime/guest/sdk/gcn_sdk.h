@@ -26,6 +26,7 @@ void gcn_os_interrupt_leave(int old);
  * deliver what is pending (disc reads, ARAM DMA, DSP, GPU), as the hardware would take them
  * there; no retrace, no thread switch */
 void gcn_interrupt_point(void);
+void gcn_idle_point(void);    /* thread.c: interrupts re-enabled; the idle thread lets time pass */
 
 /* interrupt.c: runs the handlers of pending hardware interrupts; returns how many */
 int gcn_dispatch_interrupts(void);

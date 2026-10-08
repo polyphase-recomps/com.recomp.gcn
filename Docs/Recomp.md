@@ -108,3 +108,17 @@ the instructions inline; recompiling takes ~0.3 s.
   through the helpers).
 - **Busy-wait loops** (no stores, no calls, nothing advancing) let pending interrupts and
   retraces happen after 2048 rounds.
+- **Hand-written code the recompiler cannot express** (a thread switch that swaps the stack
+  pointer and return address): a package's `Recomp/names.txt` line `native <name>` hands the
+  function to the recomp runtime's own implementation (`Runtime/recomp/recomp_native.c`), which
+  works on the guest registers directly. The GS engine's cooperative threads (Pokemon Colosseum,
+  Pokemon XD: `threadExecute`, `_threadSwitch`) run on a host coroutine each that way.
+- **REL modules without symbols** (Live): a module the decomp does not describe is still
+  recompiled when it links; its functions start at its prolog / epilog / unresolved, at its
+  relocations into its own code and at its `bl` targets.
+- **Runtime stand-ins**: the runtime's `FALLBACK` definitions (e.g. `THPAudioDecode`, MSL's
+  `__sys_alloc`) are placeholders for library code games link themselves; the game's own code
+  wins in recomp builds as the linker makes it win in decomp builds.
+- **Idle threads**: a priority-31 thread that never waits (OSSetIdleFunction's) lets time pass
+  where it re-enables interrupts: on the console it only runs while everyone else waits.
+- **Disc images**: `.iso`, `.gcm`, `.nkit.iso` and `.ciso` (read directly and unpacked).

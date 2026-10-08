@@ -35,6 +35,7 @@
 #include "Plugins/PolyphaseBuildTargetAPI.h"
 
 extern "C" {
+#include "Gcn/gcn_disc.h"
 #include "Gcn/gcnw_module.h"
 }
 
@@ -693,12 +694,15 @@ DiscCheck CheckDisc(const std::string& pathIn, const GamePackage& game)
     const std::string path = Trim(pathIn);
     if (path.empty())
     {
-        c.message = "Pick your disc image (.iso, .gcm or .nkit.iso).";
+        c.message = "Pick your disc image (.iso, .gcm, .nkit.iso or .ciso).";
         return c;
     }
-    std::ifstream f(path, std::ios::binary);
+    // the runtime's reader: plain, NKit and CISO images
     unsigned char hdr[0x440] = {};
-    if (!f || !f.read((char*)hdr, sizeof(hdr)))
+    GcnDisc* disc = std::ifstream(path, std::ios::binary) ? gcn_disc_open(path.c_str()) : nullptr;
+    const bool read = disc != nullptr && gcn_disc_read(disc, hdr, 0, sizeof(hdr)) == sizeof(hdr);
+    if (disc != nullptr) gcn_disc_close(disc);
+    if (!read)
     {
         c.message = "Cannot read " + path + ".";
         return c;
@@ -706,7 +710,7 @@ DiscCheck CheckDisc(const std::string& pathIn, const GamePackage& game)
     const uint32_t magic = (uint32_t(hdr[0x1C]) << 24) | (uint32_t(hdr[0x1D]) << 16) | (uint32_t(hdr[0x1E]) << 8) | hdr[0x1F];
     if (magic != 0xC2339F3Du)
     {
-        c.message = "Not a GameCube disc image (compressed formats like .rvz/.ciso are not read: convert to .iso).";
+        c.message = "Not a GameCube disc image (compressed formats like .rvz/.gcz are not read: convert to .iso).";
         return c;
     }
     const std::string id((const char*)hdr, 6);
@@ -875,7 +879,7 @@ bool DrawPreprocessModal(void*)
     if (ImGui::Button("Browse...##disc") && sHooks != nullptr && sHooks->ShowOpenFileDialog != nullptr)
     {
         char picked[1024] = "";
-        if (sHooks->ShowOpenFileDialog("Your disc image (.iso / .gcm / .nkit.iso)", "Disc image|*.iso;*.gcm", nullptr,
+        if (sHooks->ShowOpenFileDialog("Your disc image (.iso / .gcm / .nkit.iso / .ciso)", "Disc image|*.iso;*.gcm;*.ciso", nullptr,
                                        picked, sizeof(picked)))
         {
             snprintf(m.disc, sizeof(m.disc), "%s", picked);

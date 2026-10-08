@@ -44,7 +44,8 @@ set(GCN_RECOMP "${GCN_ROOT}/Runtime/recomp")
 set(SLJIT "${GCN_ROOT}/ThirdParty/sljit/sljit_src")
 
 file(GLOB HLE_SOURCES "${GCN_HLE_DIR}/${GCN_HLE_NAME}_guest_*.c")
-set(RECOMP_GLUE_SOURCES ${HLE_SOURCES} "${GCN_HLE_DIR}/${GCN_HLE_NAME}_glue.c" "${GCN_RECOMP}/recomp_gcn.c")
+set(RECOMP_GLUE_SOURCES ${HLE_SOURCES} "${GCN_HLE_DIR}/${GCN_HLE_NAME}_glue.c" "${GCN_RECOMP}/recomp_gcn.c"
+    "${GCN_RECOMP}/recomp_native.c")
 if(GCN_RECOMP_LIVE)
     set(GCNR_FMA OFF)
     set(RECOMP_GAME_SOURCES

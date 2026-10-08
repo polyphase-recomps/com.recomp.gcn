@@ -57,6 +57,12 @@ void gcn_mod_set_pad_buttons(unsigned short buttons);
 /* Controller 0's main stick this frame, -128..127 each (up and right positive). */
 void gcn_mod_pad_stick(int *x, int *y);
 void gcn_mod_set_pad_stick(int x, int y);
+/* ... its C-stick (the host's right stick), the same way */
+void gcn_mod_pad_substick(int *x, int *y);
+void gcn_mod_set_pad_substick(int x, int y);
+/* ... its analog L and R triggers, 0..255 */
+void gcn_mod_pad_triggers(int *l, int *r);
+void gcn_mod_set_pad_triggers(int l, int r);
 /* On-screen text: line 0..15 up from the bottom left of the picture, shown on every frame until it
  * changes; NULL or "" clears it. Digits, letters (lower case shows as upper case) and
  * . , : - + = _ / % ( ) ! ? */

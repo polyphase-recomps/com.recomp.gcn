@@ -17,6 +17,11 @@
 #define MAX_THREADS 64
 #define CTX(t) ((t)->context.gpr[0])    /* host context + 1; 0 = not started */
 #define STARTED(t) ((t)->context.gpr[2]) /* entry function, kept until the context starts */
+/* the thread's interrupt state while it is switched out (the MSR its context holds on the
+ * console): MSR_EE when enabled. A thread that blocks with interrupts off (VIWaitForRetrace,
+ * OSSleepThread in a disabled section) must not leave them off for the thread that runs next */
+#define IRQ(t) ((t)->context.srr1)
+#define IRQ_ON 0x8000u
 
 static OSThread sMainThread;
 static OSThread *sCurrent;
@@ -129,6 +134,8 @@ static void switch_to(OSThread *t)
     if (t == prev) return;
     if (prev->state == OS_THREAD_STATE_RUNNING) prev->state = OS_THREAD_STATE_READY;
     t->state = OS_THREAD_STATE_RUNNING;
+    IRQ(prev) = gcn_os_interrupts_enabled() ? IRQ_ON : 0;
+    gcn_os_interrupt_leave((IRQ(t) & IRQ_ON) != 0);
     sCurrent = t;
     if (CTX(t) == 0)
     {
@@ -253,6 +260,29 @@ void gcn_interrupt_point(void)
     events_end();
 }
 
+/* The idle thread (OSSetIdleFunction: priority 31, the lowest) runs only when every other thread
+ * waits, and on the console its loop never waits itself (the GS engine's background task loop):
+ * it gets what is left of each frame until the retrace interrupt wakes the others. Here time
+ * passes only when nothing can run, so where it re-enables interrupts, deliver what is due and,
+ * after a frame's worth of passes, let the retrace happen; whoever that wakes outranks it. */
+#define IDLE_PASSES_PER_FRAME 64
+void gcn_idle_point(void)
+{
+    static int passes;
+
+    if (sInEvents || sSchedulerOff || !sCurrent || sCurrent->priority != OS_PRIORITY_MAX) return;
+    if (++passes < IDLE_PASSES_PER_FRAME)
+    {
+        gcn_interrupt_point();
+    }
+    else
+    {
+        passes = 0;
+        gcn_idle();
+    }
+    gcn_reschedule();
+}
+
 void *gcn_thread_main(void *(*fn)(void *), void *arg)
 {
     void *ret = fn(arg);
@@ -266,6 +296,7 @@ int OSCreateThread(OSThread *thread, void *(*func)(void *), void *param, void *s
     if (priority < OS_PRIORITY_MIN || priority > OS_PRIORITY_MAX) return FALSE;
     memset(thread, 0, sizeof(*thread));
     thread->state = OS_THREAD_STATE_READY;
+    IRQ(thread) = IRQ_ON; /* a new thread starts with interrupts enabled */
     thread->attr = attr & 1;
     thread->base = thread->priority = priority;
     thread->suspend = 1;

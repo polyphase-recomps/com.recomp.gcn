@@ -39,6 +39,14 @@ def main():
     exports = {m.group(1): (m.group(2), m.group(3), params(m.group(4))) for m in EXPORT_RE.finditer(header)}
     imports = {m.group(1): (m.group(2), m.group(3), params(m.group(4))) for m in IMPORT_RE.finditer(header)}
     hle = [l.split()[1] for l in open(syms_path) if l.startswith('hle ')]
+    native = {l.split()[1] for l in open(syms_path) if l.startswith('native ')}
+    # the game's own printf-style log functions (syms.txt `log`): to the runtime's OSReport
+    logs = {l.split()[1] for l in open(syms_path) if l.startswith('log ')}
+    addr_of = {}
+    for l in open(syms_path):
+        if l.startswith('func '):
+            f = l.split()
+            addr_of.setdefault(f[3], int(f[1], 16))
     game = {}
     gf = os.path.join(hle_dir, name + '_game_functions.txt')
     if os.path.isfile(gf):
@@ -70,15 +78,26 @@ def main():
              '*sp_ = ((c)->r[1] - 64u) & ~15u' % name)
     o.append('#define HLE_LEAVE() *sp_ = saved_\n')
 
+    # functions the recomp runtime implements itself (syms.txt `native`, recomp_native.c)
+    if native:
+        o.append('void gcnr_native_call(const char* name, uint32_t self, uint8_t* mem, gcnr_ctx* c);\n')
+    for n in sorted(native):
+        o.append('void hle_%s(uint8_t* mem, gcnr_ctx* c)\n{' % n)
+        o.append('    if (GCNR_UNLIKELY(gcnr_trace_left)) gcnr_trace_hle("%s", mem, c);' % n)
+        o.append('    gcnr_native_call("%s", 0x%08Xu, mem, c);\n}\n' % (n, addr_of.get(n, 0)))
+
     missing = []
     for n in hle:
-        if n not in exports:
+        if n in native:
+            continue
+        src = 'OSReport' if n in logs else n
+        if src not in exports:
             missing.append(n)
             continue
-        ret, fn, ps = exports[n]
+        ret, fn, ps = exports[src]
         o.append('void hle_%s(uint8_t* mem, gcnr_ctx* c)\n{' % n)
         gpr, fpr, stack, args = 3, 1, 0, []
-        fixed = VARIADIC.get(n)
+        fixed = VARIADIC.get(src)
         for i, p in enumerate(ps):
             if fixed is not None and i == fixed + 1:
                 args.append('va')  # the variadic buffer

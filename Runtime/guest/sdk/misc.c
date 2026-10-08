@@ -8,6 +8,10 @@
 #include "gcn_guest.h"
 
 #define WEAK __attribute__((weak))
+/* a stand-in for what a game normally links itself (pure library code): the game's own
+ * definition wins, in the decomp build (the linker) and in recomp builds alike (gcn_syms.py
+ * leaves FALLBACK functions out of the HLE set when the game has them) */
+#define FALLBACK WEAK
 
 /* MSL console: stdout / stderr lines end up in the host log */
 static char sLine[256];
@@ -57,16 +61,16 @@ WEAK int WriteUARTN(const void *buf, u32 len)
 }
 
 /* Metrowerks runtime block copies (used by its memcpy / memmove) */
-WEAK void __copy_longs_aligned(void *dst, const void *src, size_t n) { memcpy(dst, src, n); }
-WEAK void __copy_longs_unaligned(void *dst, const void *src, size_t n) { memcpy(dst, src, n); }
-WEAK void __copy_longs_rev_aligned(void *dst, const void *src, size_t n) { memmove(dst, src, n); }
-WEAK void __copy_longs_rev_unaligned(void *dst, const void *src, size_t n) { memmove(dst, src, n); }
+FALLBACK void __copy_longs_aligned(void *dst, const void *src, size_t n) { memcpy(dst, src, n); }
+FALLBACK void __copy_longs_unaligned(void *dst, const void *src, size_t n) { memcpy(dst, src, n); }
+FALLBACK void __copy_longs_rev_aligned(void *dst, const void *src, size_t n) { memmove(dst, src, n); }
+FALLBACK void __copy_longs_rev_unaligned(void *dst, const void *src, size_t n) { memmove(dst, src, n); }
 
 /* THP video: guest/sdk/thp.c; audio frames are the SDK's own (THPAudio.c) when the game
  * links it */
-WEAK s32 THPAudioDecode(s16 *buffer, u8 *audioFrame, s32 flag) { return 0; }
+FALLBACK s32 THPAudioDecode(s16 *buffer, u8 *audioFrame, s32 flag) { return 0; }
 
 /* MSL's malloc asks the OS for memory through these; games use OSAlloc instead */
-WEAK void *__sys_alloc(size_t size) { return 0; }
-WEAK void __sys_free(void *ptr) {}
+FALLBACK void *__sys_alloc(size_t size) { return 0; }
+FALLBACK void __sys_free(void *ptr) {}
 WEAK void (*__stdio_exit)(void) = 0;

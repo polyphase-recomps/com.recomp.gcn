@@ -199,6 +199,7 @@ typedef struct
 
 static Ctx sCtx[MAX_CTX];
 static int sCurrentCtx;
+static uint32_t sRunCount;
 
 static void ctx_main(void *p)
 {
@@ -212,6 +213,7 @@ static void ctx_main(void *p)
 
 void gcnw_run(void)
 {
+    sRunCount++;
     memset(sCtx, 0, sizeof(sCtx));
     sCtx[0].coro = gcnp_coro_current();
     sCtx[0].used = 1;
@@ -264,6 +266,15 @@ void w2c_env_gcn_host_ctx_switch(struct w2c_env *env, u32 ctx)
     gcnp_coro_switch(to->coro);
     /* resumed: restore this context's guest stack */
     *sModule->stack_pointer() = from->sp;
+}
+
+uint32_t gcnw_run_count(void) { return sRunCount; }
+
+struct GcnpCoro *gcnw_ctx_swap_coro(struct GcnpCoro *coro)
+{
+    GcnpCoro *old = sCtx[sCurrentCtx].coro;
+    sCtx[sCurrentCtx].coro = coro;
+    return old;
 }
 
 void w2c_env_gcn_host_ctx_destroy(struct w2c_env *env, u32 ctx)
@@ -622,7 +633,12 @@ void w2c_env_gcn_host_dcache(struct w2c_env *env, u32 op, u32 addr, u32 bytes)
     PROF_BEGIN();
     (void)env;
     (void)op;
-    if (bytes > GCNW_MEM_BYTES) bytes = GCNW_MEM_BYTES;
+    /* a cache operation past memory does nothing (the console has no lines there) */
+    {
+        const u32 off = GCNW_OFFSET(addr);
+        if (off >= GCNW_MEM_BYTES) return;
+        if (bytes > GCNW_MEM_BYTES - off) bytes = GCNW_MEM_BYTES - off;
+    }
     gcnw_dcache_flush(guest_ptr(addr, bytes), bytes);
     PROF_END(PROF_DCACHE);
 }

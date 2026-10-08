@@ -30,6 +30,8 @@ The API is `Runtime/include/gcn_mod.h`:
 | `gcn_mod_emit(name, args, nargs)` | send an event to scripts (`Gcn.Events()`) |
 | `gcn_mod_pad_buttons()`, `gcn_mod_set_pad_buttons(b)` | controller 1 as the game sees it this frame (inside frame hooks) |
 | `gcn_mod_pad_stick(&x, &y)`, `gcn_mod_set_pad_stick(x, y)` | controller 1's main stick this frame, -128..127 (up and right positive) |
+| `gcn_mod_pad_substick(&x, &y)`, `gcn_mod_set_pad_substick(x, y)` | its C-stick (the host's right stick), the same way |
+| `gcn_mod_pad_triggers(&l, &r)`, `gcn_mod_set_pad_triggers(l, r)` | its analog L and R, 0..255 |
 | `gcn_mod_overlay(line, text)` | on-screen text, line 0..15 up from the bottom left, until changed (`""` clears); digits, letters and `.,:-+=_/%()!?` |
 | `gcn_mod_log(fmt, ...)` | a line in the log |
 
@@ -92,6 +94,22 @@ difference). What makes that work:
   its name.
 
 Patches (`Native/patches/`) change the decomp's source, so they only affect the decomp build.
+
+**Replacing a game function (recomp builds).** A mod that defines a function by the game's own
+symbol name (C++ names mangled as in the decomp's `symbols.txt`, e.g.
+`ShouldSkipCinematic__22CScriptSpecialFunctionCFR13CStateManager`) takes that function's place: the
+recompiled game calls the mod's version, with the PowerPC calling convention (`this` first,
+integer / pointer and float arguments as the function's own). The mod's version can't call the
+original, so it does what the original did where it should (its code from the decomp, offsets
+read from the game's machine code). It counts once the function is in the package's HLE list:
+build once, then regenerate the list and `Recomp/syms.txt` (Metroid Prime:
+`Recomp/tools/mp_hle_list.py` counts the mods' functions), then build again. Mark it
+`__attribute__((used))`. Examples: `com.recomp.metroidprime/Native/mods/skip.c`, `look.c`.
+
+**Trying mods without the editor.** The test runner takes `--set NAME=VALUE@FRAME` (a published
+variable; a `.` in VALUE writes a float), `--request NAME[:A,B]@FRAME`, `--print-vars A,B,...`
+(their values at every frame dump, `--every`) and `--stick "F:LX,LY,CX,CY:DURATION,..."` (main
+stick and C-stick, -128..127) next to `--script` (buttons).
 
 ## Lua: the `Gcn` table
 

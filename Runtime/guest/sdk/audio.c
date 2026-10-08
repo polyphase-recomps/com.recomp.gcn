@@ -210,7 +210,11 @@ u32 ARAlloc(u32 length)
 u32 ARFree(u32 *length) { return sAramTop; }
 
 void ARQInit(void) {}
-void ARQSetChunkSize(u32 size) {}
+/* the transfer chunk size: transfers are done at once here, but games size their buffers by it
+ * (Pokemon Colosseum's sound bank loader fails on 0); ARQInit sets the SDK's default */
+static u32 sArqChunk = 4096;
+void ARQSetChunkSize(u32 size) { sArqChunk = (size + 31) & ~31u; }
+u32 ARQGetChunkSize(void) { return sArqChunk; }
 
 #define ARQ_PENDING 1024
 static struct

@@ -5,6 +5,10 @@
  * packaged games carry their data as plain files) is a list of segments: each file of
  * the disc, its boot block, executable and file table, with the disc offset it sits at
  * (disc.idx). Reads are served from those files, so the game sees the original disc.
+ *
+ * Images: plain .iso / .gcm, NKit .nkit.iso, and CISO .ciso (a 32 KB header: "CISO", the
+ * block size, one byte per disc block saying whether it is stored; the stored blocks follow
+ * in order, absent ones read as zeros).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +29,9 @@ struct GcnDisc
 {
     FILE *image; /* an image file, or NULL for an unpacked disc */
     uint64_t size;
+    uint32_t cisoBlock;   /* CISO: block size (0: not CISO) */
+    uint32_t cisoCount;   /* CISO: disc blocks in the map */
+    uint32_t *cisoWhere;  /* CISO: stored block index + 1 of each disc block (0: absent) */
     Segment *seg;
     int count;
     struct
@@ -117,6 +124,59 @@ static GcnDisc *open_unpacked(const char *dir)
     return d;
 }
 
+#define CISO_HEADER 0x8000u
+#define GCN_DISC_SIZE 1459978240ull
+
+static int open_ciso(GcnDisc *d)
+{
+    uint8_t *hdr = (uint8_t *)malloc(CISO_HEADER);
+    uint32_t i, stored = 0, last = 0;
+
+    if (!seek(d->image, 0) || fread(hdr, 1, CISO_HEADER, d->image) != CISO_HEADER || memcmp(hdr, "CISO", 4))
+    {
+        free(hdr);
+        return 0;
+    }
+    d->cisoBlock = hdr[4] | hdr[5] << 8 | hdr[6] << 16 | (uint32_t)hdr[7] << 24;
+    d->cisoCount = CISO_HEADER - 8;
+    d->cisoWhere = (uint32_t *)calloc(d->cisoCount, sizeof(uint32_t));
+    for (i = 0; i < d->cisoCount; i++)
+        if (hdr[8 + i])
+        {
+            d->cisoWhere[i] = ++stored;
+            last = i + 1;
+        }
+    free(hdr);
+    if (!d->cisoBlock) return 0;
+    d->size = (uint64_t)last * d->cisoBlock;
+    if (d->size < GCN_DISC_SIZE) d->size = GCN_DISC_SIZE;
+    return 1;
+}
+
+static uint32_t read_ciso(GcnDisc *d, uint8_t *out, uint64_t offset, uint32_t size)
+{
+    uint32_t done = 0;
+
+    while (done < size)
+    {
+        uint64_t pos = offset + done, block = pos / d->cisoBlock;
+        uint32_t inside = (uint32_t)(pos % d->cisoBlock), n = d->cisoBlock - inside;
+
+        if (n > size - done) n = size - done;
+        if (block < d->cisoCount && d->cisoWhere[block])
+        {
+            uint64_t at = CISO_HEADER + (uint64_t)(d->cisoWhere[block] - 1) * d->cisoBlock + inside;
+            if (!seek(d->image, at) || fread(out + done, 1, n, d->image) != n) memset(out + done, 0, n);
+        }
+        else
+        {
+            memset(out + done, 0, n);
+        }
+        done += n;
+    }
+    return done;
+}
+
 GcnDisc *gcn_disc_open(const char *path)
 {
     GcnDisc *d;
@@ -134,6 +194,12 @@ GcnDisc *gcn_disc_open(const char *path)
     fseeko(f, 0, SEEK_END);
     d->size = (uint64_t)ftello(f);
 #endif
+    if (!open_ciso(d))
+    {
+        free(d->cisoWhere);
+        d->cisoWhere = NULL;
+        d->cisoBlock = 0;
+    }
     return d;
 }
 
@@ -147,6 +213,7 @@ void gcn_disc_close(GcnDisc *d)
         if (d->open[i].f) fclose(d->open[i].f);
     for (i = 0; i < d->count; i++) free(d->seg[i].path);
     free(d->seg);
+    free(d->cisoWhere);
     free(d);
 }
 
@@ -178,6 +245,7 @@ uint32_t gcn_disc_read(GcnDisc *d, void *dst, uint64_t offset, uint32_t size)
     uint32_t done = 0;
 
     if (!d) return 0;
+    if (d->image && d->cisoBlock) return read_ciso(d, out, offset, size);
     if (d->image)
     {
         if (!seek(d->image, offset)) return 0;

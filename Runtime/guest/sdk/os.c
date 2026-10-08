@@ -118,6 +118,7 @@ WEAK BOOL OSEnableInterrupts(void)
 {
     BOOL old = sInterruptsEnabled;
     sInterruptsEnabled = TRUE;
+    if (sBooted) gcn_idle_point();
     return old;
 }
 
@@ -125,6 +126,7 @@ WEAK BOOL OSRestoreInterrupts(BOOL level)
 {
     BOOL old = sInterruptsEnabled;
     sInterruptsEnabled = level;
+    if (level && sBooted) gcn_idle_point();
     return old;
 }
 
@@ -282,6 +284,17 @@ WEAK void DCInvalidateRange(void *addr, u32 nBytes) { gcn_host_dcache(2, addr, n
 WEAK void DCZeroRange(void *addr, u32 nBytes) { memset(addr, 0, nBytes); }
 WEAK void ICInvalidateRange(void *addr, u32 nBytes) {}
 WEAK void ICFlashInvalidate(void) {}
+
+/* memory protection (MI): none here. Games protect the dev kit's memory above 24 MB
+ * (Pokemon Colosseum: 0x81800000+0x1800000), which the game's own code first flushes */
+void OSProtectRange(u32 chan, void *addr, u32 nBytes, u32 control);
+WEAK void OSProtectRange(u32 chan, void *addr, u32 nBytes, u32 control)
+{
+    (void)chan;
+    (void)addr;
+    (void)nBytes;
+    (void)control;
+}
 
 /* Locked cache: 16 KB at 0xE0000000, a separate window of guest memory (host gcnw.h). */
 WEAK void LCEnable(void) {}

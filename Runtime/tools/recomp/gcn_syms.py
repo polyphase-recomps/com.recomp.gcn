@@ -16,6 +16,10 @@ and writes a plain text file the recompiler reads:
     label <addr> <name>       labels inside text (extra entry points)
     jumptable <addr> <size>   data objects that may be switch tables (absolute code addresses)
     hle <name>                functions the runtime supplies instead of the recompiled code
+    native <name>             of those, the ones the recomp runtime itself implements with the guest
+                              registers in hand (Runtime/recomp/recomp_native.c: hand-written code
+                              the recompiler cannot express, e.g. GS engine thread switches);
+                              from `native <name>` lines of --names files
     data <addr> <size> <name> the decomp's globals at their DOL addresses (--placed): what the
                               package's mods name, in the recomp build too
 
@@ -143,9 +147,11 @@ def hle_from_runtime(map_path, src_dir, functions):
     if src_dir:
         import glob
         for path in glob.glob(os.path.join(src_dir, "**", "*.c"), recursive=True):
+            text = open(path, encoding="utf-8", errors="replace").read()
+            # any file's FALLBACK definitions: stand-ins for library code the game links itself
+            weak |= set(re.findall(r"^FALLBACK\s+[\w\s\*]*?\b(\w+)\s*\(", text, re.M))
             if os.path.basename(path) not in LIBRARY_FALLBACKS:
                 continue
-            text = open(path, encoding="utf-8", errors="replace").read()
             weak |= set(re.findall(r"^WEAK\s+[\w\s\*]*?\b(\w+)\s*\(", text, re.M))
     return (runtime - weak) & functions
 
@@ -200,7 +206,8 @@ def main():
     ap.add_argument("--names", action="append", default=[],
                     help="'0xADDR name' lines naming functions the decomp leaves unnamed (gcn_sdkmatch.py's "
                          "output, a package's hand-checked names.txt); 'stub 0xADDR value' lines make a function "
-                         "return value instead of running (hardware the runtime does not have)")
+                         "return value instead of running (hardware the runtime does not have); 'native name' "
+                         "lines hand a function to the recomp runtime's own implementation (recomp_native.c)")
     ap.add_argument("--runtime-map", help="an HLE build's link map (Runtime/tools/recomp/gcn_hle_build.py): without "
                                           "a decomp build, the HLE set is every function the runtime defines, "
                                           "except its weak fallbacks (--runtime-src), that the game has by name")
@@ -216,12 +223,18 @@ def main():
     syms = read_symbols(args.symbols)
     in_text = lambda a: any(base <= a < base + size for base, size, _ in text)
     stubs = {}
+    native = set()
+    logs = set()  # the game's printf-style log functions: to the runtime's OSReport (`log` lines)
     for path in args.names:
         rename = {}
         for line in open(path, encoding="utf-8"):
             f = line.split()
             if len(f) >= 3 and f[0] == "stub":
                 stubs[int(f[1], 0)] = int(f[2], 0)
+            elif len(f) >= 2 and f[0] == "native":
+                native.add(f[1])
+            elif len(f) >= 2 and f[0] == "log":
+                logs.add(f[1])
             elif len(f) >= 2 and f[0].startswith("0x"):
                 rename[int(f[0], 0)] = f[1]
         for s in syms:
@@ -245,6 +258,10 @@ def main():
     elif args.hle:
         with open(args.hle) as f:
             hle = {l.strip() for l in f if l.strip() and not l.startswith("#")} & names
+    missing = sorted(native - names)
+    if missing:
+        raise SystemExit("gcn_syms: native functions the game does not have by name: " + " ".join(missing))
+    hle |= native | (logs & names)
     if args.write_hle:
         with open(args.write_hle, "w", newline="\n") as f:
             f.write("# functions com.recomp.gcn's runtime supplies (from the decomp build's link map)\n")
@@ -279,6 +296,10 @@ def main():
             f.write("jumptable 0x%08X 0x%X\n" % (s["addr"], s["size"]))
         for n in sorted(hle):
             f.write("hle %s\n" % n)
+        for n in sorted(native):
+            f.write("native %s\n" % n)
+        for n in sorted(logs & names):
+            f.write("log %s\n" % n)
         for addr in sorted(stubs):
             f.write("stub 0x%08X 0x%X\n" % (addr, stubs[addr] & 0xFFFFFFFF))
         placed = read_placed(args.placed, dol_data_ranges(dol)) if args.placed else {}

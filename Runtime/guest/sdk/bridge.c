@@ -136,6 +136,32 @@ void gcn_mod_set_pad_stick(int x, int y)
     sPads[0].stickY = (s8)(y < -128 ? -128 : y > 127 ? 127 : y);
 }
 
+void gcn_mod_pad_substick(int *x, int *y)
+{
+    if (x) *x = sPads ? sPads[0].substickX : 0;
+    if (y) *y = sPads ? sPads[0].substickY : 0;
+}
+
+void gcn_mod_set_pad_substick(int x, int y)
+{
+    if (!sPads) return;
+    sPads[0].substickX = (s8)(x < -128 ? -128 : x > 127 ? 127 : x);
+    sPads[0].substickY = (s8)(y < -128 ? -128 : y > 127 ? 127 : y);
+}
+
+void gcn_mod_pad_triggers(int *l, int *r)
+{
+    if (l) *l = sPads ? sPads[0].triggerLeft : 0;
+    if (r) *r = sPads ? sPads[0].triggerRight : 0;
+}
+
+void gcn_mod_set_pad_triggers(int l, int r)
+{
+    if (!sPads) return;
+    sPads[0].triggerLeft = (u8)(l < 0 ? 0 : l > 255 ? 255 : l);
+    sPads[0].triggerRight = (u8)(r < 0 ? 0 : r > 255 ? 255 : r);
+}
+
 void gcn_mod_overlay(int line, const char *text)
 {
     gcn_host_overlay(line, text ? text : "");

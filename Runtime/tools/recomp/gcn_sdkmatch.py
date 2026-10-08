@@ -156,6 +156,12 @@ def by_rules(tfun, twords, final, unnamed):
             return 'CARDGetAttributes'
         if '__CARDSetDiskID' in s and 'OSRegisterResetFunction' in s:
             return 'CARDInit'
+        # (chan, fileNo, fileInfo) with __CARDAccess inlined (two memcmp of game / company)
+        if s == {'__CARDGetControlBlock', '__CARDGetDirBlock', 'memcmp', '__CARDPutControlBlock'} and \
+                known.count('memcmp') == 2 and 0x100 <= size <= 0x200:
+            return 'CARDFastOpen'
+        if 'PADSetSpec' in s and 'OSRegisterVersion' in s:
+            return 'PADInit'
         # cards[chan].xferred: mulli rX,r3,sizeof(CARDControl) ... lwz r3,0xB8(r3); blr
         if not seq and len(w) == 6 and (w[0] & 0xFC1FFFFF) == 0x1C030110 and 0x806300B8 in w and w[-1] == 0x4E800020:
             return 'CARDGetXferredBytes'

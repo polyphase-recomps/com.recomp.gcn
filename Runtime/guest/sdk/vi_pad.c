@@ -11,6 +11,7 @@
 #include "gcn_sdk.h"
 
 static VIRetraceCallback sPreRetrace, sPostRetrace;
+static PADSamplingCallback sPadSampling; /* PADSetSamplingCallback: the SI poll's callback */
 static volatile u32 sRetraceCount;
 static OSThreadQueue sRetraceQueue;
 static void *sNextFb, *sCurrentFb;
@@ -59,6 +60,9 @@ u32 gcn_vi_retrace(void)
         if (sPreRetrace) sPreRetrace(sRetraceCount);
         gcn_audio_retrace();
         if (sPostRetrace) sPostRetrace(sRetraceCount);
+        /* the controllers are sampled once a frame (the SI polls at the default rate); games
+         * that read them in the sampling callback (Pokemon Colosseum) see input only there */
+        if (sPadSampling) sPadSampling();
     }
     OSWakeupThread(&sRetraceQueue);
     return periods;
@@ -122,7 +126,12 @@ void PADControlAllMotors(const u32 *commandArray)
     for (i = 0; i < 4; i++) PADControlMotor(i, commandArray[i]);
 }
 
-PADSamplingCallback PADSetSamplingCallback(PADSamplingCallback callback) { return 0; }
+PADSamplingCallback PADSetSamplingCallback(PADSamplingCallback callback)
+{
+    PADSamplingCallback old = sPadSampling;
+    sPadSampling = callback;
+    return old;
+}
 
 /* ---- serial interface: only what pads use --------------------------------------------- */
 BOOL SIProbe(s32 chan) { return chan == 0; }

@@ -17,6 +17,13 @@ extern "C" {
 int gcnw_instantiate(const GcnwModule *module);
 /* Runs the game on the calling coroutine; returns only if the game's main() returns. */
 void gcnw_run(void);
+/* How many times gcnw_run started a game (state kept across runs can tell a new one). */
+uint32_t gcnw_run_count(void);
+/* The coroutine the current guest thread runs on, replaced (returns the previous one): a
+ * recompiled game's own threads (recomp_native.c, GS engine threads) run on coroutines of their
+ * own on behalf of the guest thread that schedules them, so a switch back to that guest thread
+ * must land in them. */
+struct GcnpCoro *gcnw_ctx_swap_coro(struct GcnpCoro *coro);
 void gcnw_free(void);
 
 uint8_t *gcnw_memory(void);

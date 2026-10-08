@@ -13,7 +13,10 @@
  * module's relocations against other modules (OSLink rewrites those instructions whenever such a
  * module links or unlinks, so they are decoded when they run); after it, the module's code is
  * recompiled at the address the game linked it to and joins the lookup table; OSUnlink takes it
- * out again.
+ * out again. A module the symbols do not describe (a game whose decomp has no module list, e.g.
+ * Pokemon Colosseum's modules packed in its archives) is recompiled too: its functions start at its
+ * prolog / epilog / unresolved, at its relocations' targets in its own code (noted before the
+ * link) and at its bl targets, each running to the next.
  */
 #include "live.h"
 
@@ -186,6 +189,8 @@ struct LoadedModule
 
 std::map<uint32_t, LoadedModule> sModules;   // by the module's header address
 std::map<uint32_t, std::vector<Reloc>> sPending; // header -> relocations, noted before the link
+// header -> (section, offset) its relocations against itself point at (function starts among them)
+std::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> sSelfTargets;
 std::map<uint32_t, gcnr_func> sOriginal;                         // hooked function -> its recompiled code
 uint32_t sOSLink = 0, sOSLinkFixed = 0, sOSUnlink = 0;
 
@@ -256,11 +261,12 @@ uint8_t* guest(uint8_t* mem, uint32_t a)
 void note_relocations(uint8_t* mem, uint32_t m)
 {
     std::vector<Reloc> sites;
+    std::vector<std::pair<uint32_t, uint32_t>> self;
     const uint32_t id = gcnr_lw(mem, m), imp = gcnr_lw(mem, m + 0x28), impSize = gcnr_lw(mem, m + 0x2C);
     for (uint32_t k = 0; k + 8 <= impSize && k < 0x10000; k += 8)
     {
         const uint32_t mod = gcnr_lw(mem, m + imp + k), rel = gcnr_lw(mem, m + imp + k + 4);
-        if (mod == 0 || mod == id) continue;
+        if (mod == 0) continue;
         uint32_t p = m + rel, sec = 0, off = 0;
         for (int guard = 0; guard < 4000000; guard++, p += 8)
         {
@@ -269,10 +275,12 @@ void note_relocations(uint8_t* mem, uint32_t m)
             if (type == 202) { sec = s; off = 0; continue; } // R_DOLPHIN_SECTION
             off += delta;
             if (type == 201 || type == 0) continue;          // R_DOLPHIN_NOP, R_PPC_NONE
-            sites.push_back({mod, sec, off & ~3u});
+            if (mod == id) self.emplace_back(s, gcnr_lw(mem, p + 4)); // target section, addend
+            else sites.push_back({mod, sec, off & ~3u});
         }
     }
     sPending[m] = std::move(sites);
+    sSelfTargets[m] = std::move(self);
 }
 
 // after OSLink: recompile the module's code where it now is. Its relocations against other
@@ -282,12 +290,13 @@ void compile_module(uint8_t* mem, uint32_t m, std::vector<Reloc> relocs)
     const auto t0 = Clock::now();
     const uint32_t id = gcnr_lw(mem, m), nsec = gcnr_lw(mem, m + 0xC), secTable = gcnr_lw(mem, m + 0x10);
     auto syms = sModuleSyms.find(id);
+    ModuleSyms found;
     if (syms == sModuleSyms.end())
     {
-        logf("live: module %u linked at %08X has no symbols (syms.txt `module` lines): its code cannot run", id, m);
-        return;
+        found.name = "module" + std::to_string(id); // no symbols: functions found below
     }
-    const ModuleSyms& ms = syms->second;
+    const ModuleSyms& ms = syms != sModuleSyms.end() ? syms->second : found;
+    const bool discover = syms == sModuleSyms.end();
     gcnr::Program p;
     p.r2 = sR2;
     p.r13 = sR13;
@@ -321,6 +330,58 @@ void compile_module(uint8_t* mem, uint32_t m, std::vector<Reloc> relocs)
         fn.name = f.name;
         p.functions[fn.addr] = fn;
     }
+    if (discover)
+    {
+        // function starts: the header's entry points (absolute once linked), the targets of the
+        // module's relocations against itself that land in its code, and bl targets in its code
+        std::vector<uint32_t> starts;
+        auto inText = [&](uint32_t a) {
+            for (const gcnr::Section& s : p.sections)
+                if (s.text && a >= s.addr && a < s.addr + s.size) return true;
+            return false;
+        };
+        for (uint32_t off : {0x34u, 0x38u, 0x3Cu})
+        {
+            const uint32_t a = gcnr_lw(mem, m + off);
+            if (inText(a)) starts.push_back(a);
+        }
+        for (const auto& [sec, add] : sSelfTargets[m])
+        {
+            if (sec < secBase.size() && secBase[sec] && inText(secBase[sec] + add) && !((secBase[sec] + add) & 3))
+                starts.push_back(secBase[sec] + add);
+        }
+        for (const gcnr::Section& s : p.sections)
+        {
+            if (!s.text) continue;
+            for (uint32_t k = 0; k + 4 <= s.size; k += 4)
+            {
+                const uint32_t w = be32(&p.dol[s.offset + k]);
+                if ((w >> 26) != 18 || (w & 3) != 1) continue; // bl (relative)
+                int32_t li = (int32_t)(w & 0x03FFFFFCu);
+                if (li & 0x02000000) li -= 0x04000000;
+                const uint32_t t = s.addr + k + (uint32_t)li;
+                if (inText(t)) starts.push_back(t);
+            }
+        }
+        std::sort(starts.begin(), starts.end());
+        starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+        for (const gcnr::Section& s : p.sections)
+        {
+            if (!s.text) continue;
+            for (size_t i = 0; i < starts.size(); i++)
+            {
+                const uint32_t a = starts[i];
+                if (a < s.addr || a >= s.addr + s.size) continue;
+                const uint32_t end = i + 1 < starts.size() && starts[i + 1] < s.addr + s.size ? starts[i + 1] : s.addr + s.size;
+                gcnr::Function fn;
+                fn.addr = a;
+                fn.end = end;
+                fn.name = ms.name + "_" + hex(a - s.addr);
+                p.functions[fn.addr] = fn;
+            }
+        }
+    }
+    sSelfTargets.erase(m);
     for (const ModuleSymbol& l : ms.labels)
     {
         auto b = base.find(l.section);
@@ -420,9 +481,8 @@ extern "C" void gcnr_live_ensure(void)
 
     gcnr::LiveInputs in;
     in.hle = gcnr_hle_functions;
-    if (!sModuleSyms.empty())
     {
-        // the module loader: wrapped (see the top of this file)
+        // the module loader: wrapped (see the top of this file), with or without module symbols
         for (const auto& [addr, f] : program.functions)
         {
             if (f.hle) continue;
@@ -434,7 +494,8 @@ extern "C" void gcnr_live_ensure(void)
         {
             if (a) in.hooked.insert(a);
         }
-        if (!sOSLink && !sOSLinkFixed) logf("live: the game has modules, but no OSLink / OSLinkFixed by name");
+        if (!sModuleSyms.empty() && !sOSLink && !sOSLinkFixed)
+            logf("live: the game has modules, but no OSLink / OSLinkFixed by name");
     }
     gcnr::LiveResult result = gcnr::live_recompile(program, in);
     if (!result.error.empty()) fail(result.error);

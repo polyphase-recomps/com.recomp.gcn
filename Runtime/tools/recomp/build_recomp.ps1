@@ -70,6 +70,11 @@ if ($Disc -and (Test-Path $Disc -PathType Leaf)) {
     $stream = [System.IO.File]::OpenRead($Disc)
     $head = New-Object byte[] 6
     [void]$stream.Read($head, 0, 6)
+    if ([System.Text.Encoding]::ASCII.GetString($head, 0, 4) -eq 'CISO') {
+        # a CISO image: the disc starts in its first stored block, after the 32 KB block map
+        [void]$stream.Seek(0x8000, 'Begin')
+        [void]$stream.Read($head, 0, 6)
+    }
     $stream.Close()
     $want = [System.Text.Encoding]::ASCII.GetString($head)
     if ($have -ne $want) {
@@ -82,7 +87,7 @@ if ($Disc -and (Test-Path $Disc -PathType Leaf)) {
     }
 }
 elseif (-not (Test-Path $idx) -and -not $Live) {
-    throw "no disc: pass -Disc (your .iso / .gcm / .nkit.iso), or set it in Pre Process Rom"
+    throw "no disc: pass -Disc (your .iso / .gcm / .nkit.iso / .ciso), or set it in Pre Process Rom"
 }
 $dol = Join-Path $discOut 'sys\main.dol'
 if (Test-Path $dol) {

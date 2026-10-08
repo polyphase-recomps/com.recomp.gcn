@@ -11,6 +11,7 @@
 #include "GcnPlayer.h"
 
 extern "C" {
+#include "Gcn/gcn_disc.h"
 #include "Gcn/gcnw_module.h"
 }
 
@@ -82,6 +83,11 @@ std::string BaseName(const GcnwModule* module)
 class Disc
 {
 public:
+    ~Disc()
+    {
+        if (mImage != nullptr) gcn_disc_close(mImage);
+    }
+
     bool Open(const std::string& path)
     {
         mUnpacked = FileExists(path + "/disc.idx");
@@ -90,8 +96,9 @@ public:
             mPath = path;
             return Read(0, mHeader, sizeof(mHeader));
         }
-        mFile.open(path, std::ios::binary);
-        return mFile.is_open() && Read(0, mHeader, sizeof(mHeader));
+        // images through the runtime's reader (.iso, .gcm, .nkit.iso, .ciso)
+        mImage = FileExists(path) ? gcn_disc_open(path.c_str()) : nullptr;
+        return mImage != nullptr && Read(0, mHeader, sizeof(mHeader));
     }
 
     bool IsGameCube() const { return Be32(mHeader + 0x1C) == 0xC2339F3Du; }
@@ -147,15 +154,12 @@ private:
             file.read(reinterpret_cast<char*>(out), std::streamsize(size));
             return size_t(file.gcount()) == size;
         }
-        mFile.clear();
-        mFile.seekg(std::streamoff(offset));
-        mFile.read(reinterpret_cast<char*>(out), std::streamsize(size));
-        return size_t(mFile.gcount()) == size;
+        return mImage != nullptr && gcn_disc_read(mImage, out, offset, (uint32_t)size) == size;
     }
 
     bool mUnpacked = false;
     std::string mPath;
-    std::ifstream mFile;
+    GcnDisc* mImage = nullptr;
     uint8_t mHeader[0x440] = {};
 };
 
@@ -248,7 +252,7 @@ public:
         }
         else if (!HasShippedData())
         {
-            message = mMessage = "Choose your " + GameTitle() + " disc image first (.iso, .gcm or .nkit.iso)";
+            message = mMessage = "Choose your " + GameTitle() + " disc image first (.iso, .gcm, .nkit.iso or .ciso)";
             return false;
         }
         mStarted = true;
@@ -305,7 +309,7 @@ bool GcnLauncher::CheckDisc(const std::string& package, const std::string& path,
     while (!resolved.empty() && (resolved.back() == '/' || resolved.back() == '\\')) resolved.pop_back();
     const std::string file = RecompUtil::FileName(resolved);
 
-    for (const char* packed : {".rvz", ".wia", ".wbfs", ".ciso", ".gcz", ".tgc"})
+    for (const char* packed : {".rvz", ".wia", ".wbfs", ".gcz", ".tgc"})
     {
         if (EndsWithNoCase(resolved, packed))
         {
@@ -322,7 +326,7 @@ bool GcnLauncher::CheckDisc(const std::string& package, const std::string& path,
     }
     if (!disc.IsGameCube())
     {
-        message = file + " is not a GameCube disc image (.iso, .gcm or .nkit.iso)";
+        message = file + " is not a GameCube disc image (.iso, .gcm, .nkit.iso or .ciso)";
         return false;
     }
     const std::string id = disc.GameId();

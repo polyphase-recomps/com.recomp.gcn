@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """GameCube disc images: the file system (FST) and the boot executable (DOL).
 
-Plain .iso / .gcm images, and NKit .nkit.iso (a playable image whose file offsets are
-those of the FST, like any other).
+Plain .iso / .gcm images, NKit .nkit.iso (a playable image whose file offsets are
+those of the FST, like any other) and CISO .ciso (blocks of the disc with a map of which
+are present; absent blocks read as zeros).
 
     gcn_disc.py info <disc>
     gcn_disc.py ls <disc>
@@ -22,10 +23,27 @@ import struct
 import sys
 
 
+CISO_HEADER = 0x8000
+GCN_DISC_SIZE = 1459978240
+
+
 class Disc:
     def __init__(self, path):
         self.path = path
         self.f = open(path, 'rb')
+        self.size = os.path.getsize(path)
+        self.ciso = None  # CISO: block size and {disc block: file offset}
+        head = self.f.read(8)
+        if head[0:4] == b'CISO':
+            block = struct.unpack('<I', head[4:8])[0]
+            used = self.f.read(CISO_HEADER - 8)
+            where, k = {}, 0
+            for i, u in enumerate(used):
+                if u:
+                    where[i] = CISO_HEADER + k * block
+                    k += 1
+            self.ciso = (block, where)
+            self.size = max(GCN_DISC_SIZE, (max(where) + 1) * block if where else 0)
         hdr = self.read(0, 0x440)
         self.game_id = hdr[0:6].decode('ascii', 'replace')
         self.revision = hdr[7]
@@ -36,8 +54,22 @@ class Disc:
         self._files = None
 
     def read(self, off, size):
-        self.f.seek(off)
-        return self.f.read(size)
+        if not self.ciso:
+            self.f.seek(off)
+            return self.f.read(size)
+        block, where = self.ciso
+        out = []
+        while size > 0:
+            i, inside = divmod(off, block)
+            n = min(size, block - inside)
+            if i in where:
+                self.f.seek(where[i] + inside)
+                out.append(self.f.read(n))
+            else:
+                out.append(bytes(n))  # a block the image left out: zeros
+            off += n
+            size -= n
+        return b''.join(out)
 
     def files(self):
         """{path: (offset, size)} for every file in the FST."""
@@ -108,7 +140,7 @@ def unpack(d, out, force=False):
                 (d.fst_offset, d.fst_size, 'sys/fst.bin')]
     segments += [(o, s, 'files/' + p) for p, (o, s) in files.items()]
     segments.sort()
-    total = max(max(o + s for o, s, _ in segments), os.path.getsize(d.path))
+    total = max(max(o + s for o, s, _ in segments), d.size)
     for i, (o, s, rel) in enumerate(segments):
         dst = os.path.join(out, rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
