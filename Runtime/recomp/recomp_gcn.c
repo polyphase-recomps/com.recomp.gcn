@@ -462,9 +462,10 @@ void gcnr_trace_hle(const char* name, uint8_t* mem, gcnr_ctx* c)
 
 void gcnr_trace_func(uint32_t addr, uint8_t* mem, const gcnr_ctx* c)
 {
-    static int sCount;
+    static int sCount, sLimit = -1;
     (void)mem;
-    if (sCount++ > 400) return;
+    if (sLimit < 0) sLimit = getenv("GCNR_TRACE_FUNCS") ? atoi(getenv("GCNR_TRACE_FUNCS")) : 400;
+    if (sCount++ > sLimit) return;
     logf_("enter %08X lr %08X r1 %08X | r3 %08X r4 %08X r5 %08X r6 %08X r7 %08X r8 %08X | f1 %g", addr, c->lr, c->r[1],
           c->r[3], c->r[4], c->r[5], c->r[6], c->r[7], c->r[8], c->f[1].ps0);
 }
@@ -479,11 +480,40 @@ void gcnr_sp_changed(uint32_t at, uint32_t callee, uint32_t before, uint32_t aft
 }
 
 /* ---- generated-code hooks ------------------------------------------------------------------ */
+/* The HLE module's stack just below the recompiled code's frames, as the hle_<name> wrappers
+ * put it (gen_hle_glue.py HLE_ENTER): a call into the module from a loop check would otherwise
+ * run it, and the callbacks it delivers (retrace, DMA...), from the stack pointer the module had
+ * when it last called the game - on top of the game's live frames. Returns the old value. */
+static uint32_t hle_stack_below(const gcnr_ctx* c)
+{
+    uint32_t* sp = gcnr_module()->stack_pointer();
+    const uint32_t saved = *sp, want = (c->r[1] - 64u) & ~15u;
+    if (want < saved) *sp = want;
+    return saved;
+}
+
 void gcnr_loop_poll(uint8_t* mem, gcnr_ctx* c)
 {
+    uint32_t saved;
     (void)mem;
     c->loop = 0;
+    saved = hle_stack_below(c);
     gcnr_module()->spin();
+    *gcnr_module()->stack_pointer() = saved;
+}
+
+/* any other loop (GCNR_LOOP_ANY): the interrupts that are pending get delivered there, as on the
+ * console (a game polls a flag a DMA or disc interrupt sets, through calls the busy-wait check
+ * doesn't see into: Metroid Prime's CResFactory::Build waiting for an ARAM transfer) */
+void gcnr_hle_poll(void); /* gen_hle_glue.py */
+void gcnr_loop_any(uint8_t* mem, gcnr_ctx* c)
+{
+    uint32_t saved;
+    (void)mem;
+    c->loop = 0;
+    saved = hle_stack_below(c);
+    gcnr_hle_poll();
+    *gcnr_module()->stack_pointer() = saved;
 }
 
 uint32_t gcnr_mmio_read(uint32_t addr, int bytes)

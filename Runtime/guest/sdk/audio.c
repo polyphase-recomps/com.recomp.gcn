@@ -187,10 +187,17 @@ ARCallback ARRegisterDMACallback(ARCallback callback)
     return old;
 }
 
+/* The transfers happen at once; their completion callbacks are the DMA interrupt and run where
+ * interrupts are delivered (gcn_dsp_poll: the next scheduling point, spin or retrace), never
+ * inside the call that started the transfer. Games count on that: Metroid Prime's ARAM file
+ * cache (CDvdFile::PingARAMTransfer) posts a transfer and then clears the "ARAM idle" flag its
+ * callback sets, and chains the next chunk from the callbacks. */
+static int sArDmaPending;
+
 void ARStartDMA(u32 type, u32 mainmem_addr, u32 aram_addr, u32 length)
 {
     gcn_host_aram(type, (void *)mainmem_addr, aram_addr, length);
-    if (sArCallback) sArCallback();
+    if (sArCallback) sArDmaPending++;
 }
 
 u32 ARAlloc(u32 length)
@@ -205,6 +212,40 @@ u32 ARFree(u32 *length) { return sAramTop; }
 void ARQInit(void) {}
 void ARQSetChunkSize(u32 size) {}
 
+#define ARQ_PENDING 1024
+static struct
+{
+    ARQRequest *request;
+    ARQCallback callback;
+} sArqDone[ARQ_PENDING];
+static int sArqHead, sArqCount;
+
+/* The ARAM DMA interrupts: completions of ARStartDMA and ARQ transfers, in order. Transfers
+ * the callbacks start complete in the same call. Returns how many callbacks ran. */
+static int ar_poll(void)
+{
+    int ran = 0;
+
+    while ((sArDmaPending > 0 || sArqCount > 0) && ran < 4096)
+    {
+        if (sArDmaPending > 0)
+        {
+            sArDmaPending--;
+            if (sArCallback) sArCallback();
+        }
+        else
+        {
+            ARQRequest *r = sArqDone[sArqHead].request;
+            ARQCallback cb = sArqDone[sArqHead].callback;
+            sArqHead = (sArqHead + 1) % ARQ_PENDING;
+            sArqCount--;
+            cb((u32)r);
+        }
+        ran++;
+    }
+    return ran;
+}
+
 void ARQPostRequest(ARQRequest *request, u32 owner, u32 type, u32 priority, u32 source, u32 dest, u32 length,
                     ARQCallback callback)
 {
@@ -217,7 +258,12 @@ void ARQPostRequest(ARQRequest *request, u32 owner, u32 type, u32 priority, u32 
     request->callback = callback;
     if (type == ARQ_TYPE_MRAM_TO_ARAM) gcn_host_aram(type, (void *)source, dest, length);
     else gcn_host_aram(type, (void *)dest, source, length);
-    if (callback) callback((u32)request);
+    if (!callback) return;
+    /* the completion: at the next interrupt delivery (ar_poll, see ARStartDMA) */
+    if (sArqCount == ARQ_PENDING) gcn_host_fatal("gcn: too many ARAM requests waiting for completion");
+    sArqDone[(sArqHead + sArqCount) % ARQ_PENDING].request = request;
+    sArqDone[(sArqHead + sArqCount) % ARQ_PENDING].callback = callback;
+    sArqCount++;
 }
 
 /* ---- DSP --------------------------------------------------------------------------------- */
@@ -285,9 +331,10 @@ static int dsp_resume(void)
 int gcn_dsp_poll(void)
 {
     DSPTaskInfo *t = sInitPending;
+    const int ar = ar_poll(); /* the ARAM's DMA interrupts too */
 
-    if (!t) return dsp_resume();
+    if (!t) return ar + dsp_resume();
     sInitPending = 0;
     if (t->init_cb) t->init_cb(t);
-    return 1 + dsp_resume();
+    return ar + 1 + dsp_resume();
 }

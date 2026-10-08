@@ -140,10 +140,17 @@ void gcn_overlay_text(uint32_t *rgba, int stride, int w, int h, int x0, int y0, 
 
 void gcn_overlay_draw(uint32_t *rgba, int stride, int w, int h)
 {
+    gcn_overlay_draw_scaled(rgba, stride, w, h, 1);
+}
+
+void gcn_overlay_draw_scaled(uint32_t *rgba, int stride, int w, int h, int scale)
+{
     int line;
 
     if (!sAny) return;
+    if (scale < 1) scale = 1;
     for (line = 0; line < LINES; line++)
         if (sText[line][0])
-            gcn_overlay_text(rgba, stride, w, h, 8, h - 12 - (line + 1) * LINE_HEIGHT, SCALE, 0xFF40FFFFu, sText[line]);
+            gcn_overlay_text(rgba, stride, w, h, 8 * scale, h - (12 + (line + 1) * LINE_HEIGHT) * scale, SCALE * scale,
+                             0xFF40FFFFu, sText[line]);
 }

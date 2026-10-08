@@ -582,9 +582,12 @@ bool SetupGames(const std::string& decomp, bool background)
 
 const char* kDoneHint = "Reload Native Addons so the editor compiles the translated games into com.recomp.gcn";
 
-// The recomp build unpacks the disc into the project's Assets/Recomp/<name>/Disc while the
-// editor runs: tell the asset manager about those files (raw assets), so packaging copies them
-// without a project reload. Main thread only.
+// The recomp build unpacks the disc into the project's Assets/Recomp/<name>/Disc. The asset
+// manager lists every file under Assets/ as a raw asset when the project loads, so leaving the
+// files out of the list is not enough: with Package the unpacked disc off (or the game not built
+// as recomp) every listed disc file gets no platforms (a .meta sidecar each, so it holds after a
+// project reload); with it on, files unpacked while the editor runs are listed too and all of
+// them get every platform back. Main thread only.
 void RegisterRecompAssets()
 {
     AssetManager* am = AssetManager::Get();
@@ -593,13 +596,31 @@ void RegisterRecompAssets()
     if (!project.empty() && project.back() != '/') project += "/";
     for (const GamePackage& game : FindGamePackages())
     {
-        if (!UseRecomp(game)) continue;
         const std::string rel = "Assets/Recomp/" + game.name + "/Disc";
-        if (!sPackageDisc)
+        const bool pack = sPackageDisc && UseRecomp(game);
+
+        const std::string key = "/" + rel + "/";
+        const uint32_t mask = pack ? (uint32_t)PlatformBit_All : 0u;
+        std::vector<std::string> change;
+        size_t listed = 0;
+        for (const RawAssetEntry& entry : am->GetRawAssetEntries())
         {
-            LogDebug("[gcn] %s: %s stays out of the package (Package the unpacked disc is off): the game asks the "
-                     "player for their disc",
-                     game.id.c_str(), rel.c_str());
+            if (entry.mEngineAsset || Slashes(entry.mAbsolutePath).find(key) == std::string::npos) continue;
+            ++listed;
+            if (entry.mPlatformMask != mask) change.push_back(entry.mAbsolutePath);
+        }
+        for (const std::string& path : change)
+        {
+            am->ApplyAssetMetaFlags(path, mask, false);
+        }
+        if (!pack)
+        {
+            if (listed != 0)
+            {
+                LogDebug("[gcn] %s: %s stays out of the package (%u files; Package the unpacked disc is off or the "
+                         "game is not a recomp build): the game asks the player for their disc",
+                         game.id.c_str(), rel.c_str(), (unsigned)listed);
+            }
             continue;
         }
         std::error_code ec;
@@ -1130,6 +1151,11 @@ void GcnDependencies::SetPackageDisc(bool package)
     sPackageDisc = package;
 }
 
+void GcnDependencies::PrepareDiscAssets()
+{
+    RegisterRecompAssets();
+}
+
 void GcnDependencies::DrawTargetOptions(const PolyphaseBuildContext* ctx)
 {
     char value[8] = "";
@@ -1273,6 +1299,9 @@ void GcnDependencies::SetBuildMode(const char*)
 {
 }
 void GcnDependencies::SetPackageDisc(bool)
+{
+}
+void GcnDependencies::PrepareDiscAssets()
 {
 }
 

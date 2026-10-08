@@ -102,3 +102,10 @@ __attribute__((export_name("gcn_spin"))) void gcn_spin(void)
 {
     gcn_spin_wait();
 }
+
+/* recompiled loops (GCNR_LOOP_ANY): pending interrupts, when they are enabled */
+void gcn_interrupt_point(void); /* guest/sdk/thread.c */
+__attribute__((export_name("gcn_poll"))) void gcn_poll(void)
+{
+    gcn_interrupt_point();
+}

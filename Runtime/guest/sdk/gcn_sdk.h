@@ -16,6 +16,17 @@ void gcn_idle(void);
 void gcn_poll_events(void);
 void gcn_reschedule(void);
 
+/* os.c: interrupts enabled (OSDisableInterrupts / OSRestoreInterrupts); handlers run between
+ * enter (interrupts off, returns the old state) and leave (the old state back), as the
+ * exception and its rfi */
+int gcn_os_interrupts_enabled(void);
+int gcn_os_interrupt_enter(void);
+void gcn_os_interrupt_leave(int old);
+/* thread.c: the game runs a loop (recompiled code, any loop): when interrupts are enabled,
+ * deliver what is pending (disc reads, ARAM DMA, DSP, GPU), as the hardware would take them
+ * there; no retrace, no thread switch */
+void gcn_interrupt_point(void);
+
 /* interrupt.c: runs the handlers of pending hardware interrupts; returns how many */
 int gcn_dispatch_interrupts(void);
 

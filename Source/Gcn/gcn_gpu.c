@@ -75,6 +75,17 @@ static int sBreakpointHit;
 static uint16_t sTokens[TOKEN_QUEUE];
 static int sTokenHead, sTokenCount;
 
+static int tokens_per_retrace(void)
+{
+    static int mode = -1;
+    if (mode < 0)
+    {
+        const char *env = getenv("GCN_TOKENS_PER_RETRACE");
+        mode = env && env[0] == '1';
+    }
+    return mode;
+}
+
 void gcn_gpu_retrace(void)
 {
     if (sTokenCount)
@@ -93,16 +104,44 @@ static uint32_t *sEfb, *sDepth, *sDisplay;
 static int sDisplayW = 640, sDisplayH = 480;
 static GcnGpuStats sStats, sLastStats;
 
+/* render resolution: the EFB (and depth buffer) are sScale x the console's in each direction;
+ * the copies to textures read it back at the console's resolution (copy_texel). A new scale
+ * (sScaleWanted, set from any thread) takes effect after a display copy. The picture keeps
+ * its own size and scale until the next display copy. */
+#if GCN_GPU_PASSTHROUGH || defined(__3DS__)
+#define MAX_RENDER_SCALE 1
+#else
+/* the software rasteriser's cost grows with the pixels: Metroid Prime on a 24-thread i7-13700K
+ * takes 6 ms a frame at 1x, 13 at 2x, 27 at 3x, 47 at 4x (60 fps needs 16.7). Works up to 4. */
+#define MAX_RENDER_SCALE 2
+#endif
+static int sScale = 1, sEfbW = GCN_EFB_W, sEfbH = GCN_EFB_H;
+static volatile int sScaleWanted = 1;
+static int sDisplayStride = GCN_EFB_W, sDisplayScale = 1;
+static size_t sDisplayCap;
+
+void gcn_gpu_set_render_scale(int scale)
+{
+    sScaleWanted = scale < 1 ? 1 : scale > MAX_RENDER_SCALE ? MAX_RENDER_SCALE : scale;
+}
+int gcn_gpu_render_scale(void) { return sScaleWanted; }
+int gcn_gpu_max_render_scale(void) { return MAX_RENDER_SCALE; }
+int gcn_gpu_frame_stride(void) { return sDisplayStride; }
+int gcn_gpu_frame_scale(void) { return sDisplayScale; }
+
 void gcn_gpu_init(uint8_t *guest_mem)
 {
     sMem = guest_mem;
 #if !GCN_GPU_PASSTHROUGH
     if (!sEfb)
     {
+        const char *e = getenv("GCN_RENDER_SCALE");
         sTmem = (uint8_t *)calloc(1, TMEM_BYTES);
         sEfb = (uint32_t *)calloc(GCN_EFB_W * GCN_EFB_H, 4);
         sDepth = (uint32_t *)calloc(GCN_EFB_W * GCN_EFB_H, 4);
         sDisplay = (uint32_t *)calloc(GCN_EFB_W * GCN_EFB_H, 4);
+        sDisplayCap = (size_t)GCN_EFB_W * GCN_EFB_H;
+        if (e) gcn_gpu_set_render_scale(atoi(e));
     }
 #endif
     memset(sCP, 0, sizeof(sCP));
@@ -122,6 +161,7 @@ void gcn_gpu_init(uint8_t *guest_mem)
         r.efb = sEfb;
         r.depth = sDepth;
         gcn_raster_init(&r);
+        gcn_raster_set_target(sEfb, sDepth, sScale);
     }
 }
 
@@ -226,15 +266,80 @@ static int vertex_size(int fmt)
 
 /* ---- pixel engine / EFB -------------------------------------------------------------------- */
 
-/* An EFB pixel as the copy unit sees it (RGBA8, r in the low byte): colour, or depth
- * spread over r = high, g = middle, b = low byte (a = high) for depth copies. */
-static uint32_t copy_texel(int x, int y, int depth)
+/* An EFB pixel (render resolution) as the copy unit sees it (RGBA8, r in the low byte):
+ * colour, or depth spread over r = high, g = middle, b = low byte (a = high) for depth copies. */
+static uint32_t efb_texel(int x, int y, int depth)
 {
     uint32_t z;
 
-    if (!depth) return sEfb[y * GCN_EFB_W + x];
-    z = sDepth[y * GCN_EFB_W + x];
+    if (!depth) return sEfb[y * sEfbW + x];
+    z = sDepth[y * sEfbW + x];
     return ((z >> 16) & 0xFF) | (((z >> 8) & 0xFF) << 8) | ((z & 0xFF) << 16) | (((z >> 16) & 0xFF) << 24);
+}
+
+/* ... at the console's resolution: above 1x the average of the scale x scale pixels it
+ * covers (depth: the middle one, depth values don't average) */
+static uint32_t copy_texel(int x, int y, int depth)
+{
+    const int s = sScale;
+    uint32_t r = 0, g = 0, b = 0, a = 0, n;
+    int i, j;
+
+    if (s == 1) return efb_texel(x, y, depth);
+    if (depth) return efb_texel(x * s + s / 2, y * s + s / 2, 1);
+    for (j = 0; j < s; j++)
+    {
+        const uint32_t *row = &sEfb[(y * s + j) * sEfbW + x * s];
+        for (i = 0; i < s; i++)
+        {
+            uint32_t c = row[i];
+            r += c & 0xFF;
+            g += (c >> 8) & 0xFF;
+            b += (c >> 16) & 0xFF;
+            a += c >> 24;
+        }
+    }
+    n = (uint32_t)(s * s);
+    return (r / n) | ((g / n) << 8) | ((b / n) << 16) | ((a / n) << 24);
+}
+
+/* switches the EFB to sScaleWanted (after a display copy: nothing queued), carrying its
+ * contents over */
+static void apply_render_scale(void)
+{
+    const int n = sScaleWanted, w = GCN_EFB_W * n, h = GCN_EFB_H * n;
+    uint32_t *efb, *depth;
+    int x, y;
+
+    if (n == sScale) return;
+    efb = (uint32_t *)malloc((size_t)w * h * 4);
+    depth = (uint32_t *)malloc((size_t)w * h * 4);
+    if (!efb || !depth)
+    {
+        free(efb);
+        free(depth);
+        fprintf(stderr, "gcn gpu: no memory for render scale %d, staying at %d\n", n, sScale);
+        sScaleWanted = sScale;
+        return;
+    }
+    for (y = 0; y < h; y++)
+    {
+        const int sy = y * sScale / n;
+        for (x = 0; x < w; x++)
+        {
+            const int sx = x * sScale / n;
+            efb[y * w + x] = sEfb[sy * sEfbW + sx];
+            depth[y * w + x] = sDepth[sy * sEfbW + sx];
+        }
+    }
+    free(sEfb);
+    free(sDepth);
+    sEfb = efb;
+    sDepth = depth;
+    sScale = n;
+    sEfbW = w;
+    sEfbH = h;
+    gcn_raster_set_target(sEfb, sDepth, sScale);
 }
 
 /* the copy's source image, ow x oh: half-scale copies box-filter 2x2 (four channels at
@@ -414,15 +519,45 @@ static void efb_copy(uint32_t cmd)
     gcn_raster_flush(); /* the copy reads (and may clear) what queued triangles draw */
     if (to_xfb)
     {
-        if (w > GCN_EFB_W) w = GCN_EFB_W;
+        const int s = sScale;
+        int dw, dh;
+
+        if (x0 >= GCN_EFB_W) x0 = GCN_EFB_W - 1;
+        if (x0 + w > GCN_EFB_W) w = GCN_EFB_W - x0;
         if (h > GCN_EFB_H) h = GCN_EFB_H;
-        for (y = 0; y < h && y0 + y < GCN_EFB_H; y++)
+        dw = w * s;
+        dh = h * s;
+        if ((size_t)dw * dh > sDisplayCap)
         {
-            memcpy(&sDisplay[y * GCN_EFB_W], &sEfb[(y0 + y) * GCN_EFB_W + x0], (size_t)w * 4);
+            uint32_t *grown = (uint32_t *)realloc(sDisplay, (size_t)dw * dh * 4);
+            if (grown)
+            {
+                sDisplay = grown;
+                sDisplayCap = (size_t)dw * dh;
+            }
+            else
+            {
+                dw = GCN_EFB_W; /* keep the old picture */
+                dh = 0;
+            }
         }
-        sDisplayW = w;
-        sDisplayH = h;
-        gcn_overlay_draw(sDisplay, GCN_EFB_W, w, h); /* mods' on-screen text */
+        /* the picture at the render resolution, rows dw apart. The external frame buffer is
+         * YUV: no alpha. Opaque, whatever alpha the game left in the EFB (Metroid Prime clears
+         * with 0: the host's Quad, which blends by alpha, showed nothing) */
+        if (dh > 0)
+        {
+            for (y = 0; y < dh && y0 * s + y < sEfbH; y++)
+            {
+                uint32_t *dst = &sDisplay[(size_t)y * dw];
+                const uint32_t *srow = &sEfb[(y0 * s + y) * sEfbW + x0 * s];
+                for (x = 0; x < dw; x++) dst[x] = srow[x] | 0xFF000000u;
+            }
+            sDisplayW = dw;
+            sDisplayH = dh;
+            sDisplayStride = dw;
+            sDisplayScale = s;
+            gcn_overlay_draw_scaled(sDisplay, dw, dw, dh, s); /* mods' on-screen text */
+        }
         sLastStats = sStats;
         memset(&sStats, 0, sizeof(sStats));
         gcn_raster_invalidate_textures();
@@ -437,15 +572,18 @@ static void efb_copy(uint32_t cmd)
         uint32_t ar = sBP[0x4F], gb = sBP[0x50], z = sBP[0x51] & 0xFFFFFF;
         uint32_t rgba = ((ar & 0xFF) << 0) | (((gb >> 8) & 0xFF) << 8) | ((gb & 0xFF) << 16) | (((ar >> 8) & 0xFF) << 24);
 
-        for (y = y0; y < y0 + h && y < GCN_EFB_H; y++)
+        const int s = sScale;
+
+        for (y = y0 * s; y < (y0 + h) * s && y < sEfbH; y++)
         {
-            for (x = x0; x < x0 + w && x < GCN_EFB_W; x++)
+            for (x = x0 * s; x < (x0 + w) * s && x < sEfbW; x++)
             {
-                sEfb[y * GCN_EFB_W + x] = rgba;
-                sDepth[y * GCN_EFB_W + x] = z;
+                sEfb[y * sEfbW + x] = rgba;
+                sDepth[y * sEfbW + x] = z;
             }
         }
     }
+    if (to_xfb) apply_render_scale(); /* a new render resolution starts with a new picture */
 }
 
 /* ---- passthrough to the console's GPU ------------------------------------------------------ */
@@ -656,9 +794,17 @@ static void bp_write(uint32_t v)
         break;
     case 0x47: /* token, no interrupt */
     case 0x48: /* token with interrupt */
-        /* Commands run the moment they are written, but games pace themselves on the token
-         * the GPU reports per frame (draw sync) and expect it to advance one frame at a time:
-         * tokens become visible one per vertical retrace (gcn_gpu_retrace). */
+        /* Commands run the moment they are written, so the GPU has reached the token now:
+         * the PE register shows it at once (Metroid Prime waits for it in a loop, GXReadDrawSync).
+         * GCN_TOKENS_PER_RETRACE=1: one per vertical retrace instead (gcn_gpu_retrace), for
+         * games that pace their frames on the token. */
+        if (!tokens_per_retrace())
+        {
+            sToken = (uint16_t)val;
+            sPeRegs[0x0E / 2] = sToken;
+            if ((reg == 0x48)) sPending |= 1u << 18;
+            break;
+        }
         if (sTokenCount && sTokens[(sTokenHead + sTokenCount - 1) % TOKEN_QUEUE] == (uint16_t)val) break;
         if (sTokenCount < TOKEN_QUEUE)
         {

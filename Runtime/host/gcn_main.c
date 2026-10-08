@@ -117,6 +117,34 @@ static void backtrace_log(void)
         gcnp_log(line);
     }
 }
+/* Crashes (access violations, host stack overflows: runaway recursion in recompiled code): the
+ * exception and the stack, then the usual crash. Runs on the faulting thread; a stack overflow
+ * leaves it the room SetThreadStackGuarantee reserved. */
+static LONG WINAPI crash_handler(EXCEPTION_POINTERS *e)
+{
+    static volatile LONG once;
+    const DWORD code = e->ExceptionRecord->ExceptionCode;
+    char text[160];
+
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_STACK_OVERFLOW &&
+        code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    snprintf(text, sizeof(text), "gcn_runner: exception %08lX at %p (address %p)", code,
+             e->ExceptionRecord->ExceptionAddress,
+             e->ExceptionRecord->NumberParameters > 1 ? (void *)e->ExceptionRecord->ExceptionInformation[1] : NULL);
+    gcnp_log(text);
+    backtrace_log();
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void crash_handler_install(void)
+{
+    ULONG reserve = 256 * 1024;
+    SetThreadStackGuarantee(&reserve);
+    AddVectoredExceptionHandler(1, crash_handler);
+}
+
 /* Hang watchdog: if no retrace happens for a few seconds, print where the game thread is. */
 static HANDLE sGameThread;
 static volatile int sWatchFrame;
@@ -271,6 +299,7 @@ static void watchdog_start(void)
 {
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &sGameThread, 0, FALSE,
                     DUPLICATE_SAME_ACCESS);
+    crash_handler_install();
     CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
     if (getenv("GCN_PROFILE"))
     {
@@ -445,6 +474,7 @@ static void dump_frame(void)
     char path[512];
     int w, h, x, y;
     const uint32_t *px = gcn_gpu_frame(&w, &h);
+    const int stride = gcn_gpu_frame_stride();
     FILE *f;
 
     snprintf(path, sizeof(path), "%s/frame_%05d.ppm", sDumpDir, sFrame);
@@ -455,7 +485,7 @@ static void dump_frame(void)
     {
         for (x = 0; x < w; x++)
         {
-            uint32_t c = px[y * GCN_EFB_W + x];
+            uint32_t c = px[y * stride + x];
             uint8_t rgb[3] = {(uint8_t)c, (uint8_t)(c >> 8), (uint8_t)(c >> 16)};
             fwrite(rgb, 1, 3, f);
         }

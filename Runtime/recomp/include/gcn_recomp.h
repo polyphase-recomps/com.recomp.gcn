@@ -112,6 +112,15 @@ void gcnr_sp_changed(uint32_t at, uint32_t callee, uint32_t before, uint32_t aft
         if (GCNR_UNLIKELY(++(c)->loop >= GCNR_LOOP_LIMIT))         \
             gcnr_loop_poll((mem), (c));                            \
     } while (0)
+/* every other backward branch: pending interrupts every GCNR_LOOP_LIMIT rounds (when enabled),
+ * as the console takes them anywhere; no retrace, no thread switch (gcnr_loop_any) */
+void gcnr_loop_any(uint8_t* mem, gcnr_ctx* c);
+#define GCNR_LOOP_ANY(mem, c)                                      \
+    do                                                             \
+    {                                                              \
+        if (GCNR_UNLIKELY(++(c)->loop >= GCNR_LOOP_LIMIT))         \
+            gcnr_loop_any((mem), (c));                             \
+    } while (0)
 
 /* ---- guest memory -------------------------------------------------------------------------- */
 /* the same folding as gcnw.h GCNW_OFFSET on PC: RAM mirrors onto one buffer, locked cache after it */

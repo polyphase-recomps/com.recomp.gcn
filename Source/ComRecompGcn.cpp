@@ -23,6 +23,12 @@
 #include "GcnPlayer.h"
 #include "GcnProvider.h"
 
+#include "ModBaseDisplay.h" // Recomp_SetMaxResolution
+
+extern "C" {
+#include "Gcn/gcn_gpu.h"
+}
+
 static PolyphaseEngineAPI* sEngineAPI = nullptr;
 
 static int OnLoad(PolyphaseEngineAPI* api)
@@ -34,6 +40,11 @@ static int OnLoad(PolyphaseEngineAPI* api)
     // its launcher scenes can start every game of the addon from the player's disc
     Recomp_RegisterProvider(&GcnProvider::Get());
     GcnLauncher::RegisterAll();
+#if defined(RECOMP_DISPLAY_HAS_RESOLUTION)
+    // ... and its software GPU can draw larger than 640x528 (mod settings "Resolution"; 1 on
+    // consoles, where nothing is offered)
+    Recomp_SetMaxResolution(gcn_gpu_max_render_scale());
+#endif
     if (api && api->LogDebug)
     {
         api->LogDebug("com.recomp.gcn loaded!");
@@ -78,11 +89,6 @@ static bool OnPreBuild(int32_t platform, void* userData)
     char decomp[512] = "";
     if (sHooks != nullptr && sHooks->GetBuildSetting != nullptr)
     {
-        if (sHooks->GetBuildSetting(GcnDependencies::kSetupOption, value, sizeof(value)) && value[0] == '0')
-        {
-            return true;
-        }
-        sHooks->GetBuildSetting(GcnDependencies::kDecompOption, decomp, sizeof(decomp));
         char mode[16] = "";
         if (sHooks->GetBuildSetting(GcnDependencies::kModeOption, mode, sizeof(mode)))
         {
@@ -93,6 +99,12 @@ static bool OnPreBuild(int32_t platform, void* userData)
         {
             GcnDependencies::SetPackageDisc(pack[0] != '0');
         }
+        if (sHooks->GetBuildSetting(GcnDependencies::kSetupOption, value, sizeof(value)) && value[0] == '0')
+        {
+            GcnDependencies::PrepareDiscAssets(); // the disc stays out of the package even without the setup
+            return true;
+        }
+        sHooks->GetBuildSetting(GcnDependencies::kDecompOption, decomp, sizeof(decomp));
     }
     if (!GcnDependencies::SetupAll(decomp))
     {

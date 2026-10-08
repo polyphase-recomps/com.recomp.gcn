@@ -72,6 +72,14 @@ private:
     bool mmio(const Insn& i, uint32_t& ea) const;
     void load(const Insn& i, const char* fn, int bytes, bool xform, bool update, bool sign = false);
     void store(const Insn& i, const char* fn, int bytes, bool xform, bool update);
+    // the check a backward branch makes: busy-wait loops wait for events (GCNR_LOOP), every other
+    // loop takes pending interrupts now and then (GCNR_LOOP_ANY)
+    std::string loop_check(uint32_t at) const
+    {
+        if (mAn.spinLoops.count(at)) return "GCNR_LOOP(mem, c); ";
+        if (mAn.backBranches.count(at)) return "GCNR_LOOP_ANY(mem, c); ";
+        return "";
+    }
     void rc0(const Insn& i, int reg) { if (i.rc) line(fmt("GCNR_CR0(c, %s);", R(reg).c_str())); }
     void rc1(const Insn& i) { if (i.rc) line("GCNR_CR1(c);"); }
 
@@ -758,7 +766,7 @@ void Emitter::insn(const Insn& i)
         }
         else if (mAn.local(i.target))
         {
-            if (mAn.spinLoops.count(i.addr)) line("GCNR_LOOP(mem, c);");
+            if (!loop_check(i.addr).empty()) line(loop_check(i.addr));
             line(fmt("goto L_%08X;", i.target));
         }
         else
@@ -782,7 +790,7 @@ void Emitter::insn(const Insn& i)
         }
         else if (mAn.local(i.target))
         {
-            const std::string loop = mAn.spinLoops.count(i.addr) ? "GCNR_LOOP(mem, c); " : "";
+            const std::string loop = loop_check(i.addr);
             line("if (" + c + ") { " + loop + fmt("goto L_%08X; }", i.target));
         }
         else

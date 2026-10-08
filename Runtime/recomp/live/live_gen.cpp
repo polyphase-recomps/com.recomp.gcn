@@ -131,7 +131,8 @@ private:
     void jump_local(uint32_t target, sljit_jump* jump = nullptr);
     void cond_false_jumps(const Insn& i, std::vector<sljit_jump*>& out);
     void land(std::vector<sljit_jump*>& jumps);
-    void loop_check();
+    void loop_check(bool spin);
+    void loop_checks(const Analysis& an, uint32_t at);
     void unhandled(uint32_t addr, const char* what);
     void ret() { sljit_emit_return_void(C); }
     void args_mem_ctx()
@@ -242,14 +243,23 @@ void LiveGen::land(std::vector<sljit_jump*>& jumps)
     jumps.clear();
 }
 
-void LiveGen::loop_check()
+// GCNR_LOOP (busy-wait loops: wait for events) / GCNR_LOOP_ANY (any other loop: pending
+// interrupts now and then), as cgen.cpp's loop_check
+void LiveGen::loop_check(bool spin)
 {
     sljit_emit_op2(C, SLJIT_ADD32, R0, 0, CM, OFF(loop), IMM, 1);
     sljit_emit_op1(C, SLJIT_MOV32, CM, OFF(loop), R0, 0);
     sljit_jump* low = sljit_emit_cmp(C, SLJIT_LESS | SLJIT_32, R0, 0, IMM, (sljit_sw)GCNR_LOOP_LIMIT);
     args_mem_ctx();
-    sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2V(P, P), IMM, SLJIT_FUNC_ADDR(gcnr_loop_poll));
+    sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2V(P, P), IMM,
+                     spin ? SLJIT_FUNC_ADDR(gcnr_loop_poll) : SLJIT_FUNC_ADDR(gcnr_loop_any));
     sljit_set_label(low, sljit_emit_label(C));
+}
+
+void LiveGen::loop_checks(const Analysis& an, uint32_t at)
+{
+    if (an.spinLoops.count(at)) loop_check(true);
+    else if (an.backBranches.count(at)) loop_check(false);
 }
 
 void LiveGen::unhandled(uint32_t addr, const char* what)
@@ -886,7 +896,7 @@ void LiveGen::insn(const Analysis& an, const Insn& i)
         }
         else if (an.local(i.target))
         {
-            if (an.spinLoops.count(i.addr)) loop_check();
+            loop_checks(an, i.addr);
             jump_local(i.target);
         }
         else
@@ -900,7 +910,9 @@ void LiveGen::insn(const Analysis& an, const Insn& i)
         const bool local = an.local(i.target);
         if (!i.lk && local && !an.spinLoops.count(i.addr) && (i.bo() & 0x14) != 0)
         {
-            // one condition (CTR or a CR bit): straight to the target when it holds
+            // one condition (CTR or a CR bit): straight to the target when it holds (a loop's
+            // count goes up on the way out too: harmless)
+            if (an.backBranches.count(i.addr)) loop_check(false);
             const int bo = i.bo();
             if (!(bo & 4))
             {
@@ -933,7 +945,7 @@ void LiveGen::insn(const Analysis& an, const Insn& i)
         }
         else if (local)
         {
-            if (an.spinLoops.count(i.addr)) loop_check();
+            loop_checks(an, i.addr);
             jump_local(i.target);
         }
         else

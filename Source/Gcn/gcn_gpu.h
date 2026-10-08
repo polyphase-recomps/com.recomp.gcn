@@ -32,8 +32,19 @@ void gcn_gpu_reg_write(uint32_t addr, uint32_t value, int bytes);
 void gcn_gpu_retrace(void);
 /* Interrupts raised since the last call (bits = __OS_INTERRUPT_* numbers). */
 uint32_t gcn_gpu_take_interrupts(void);
-/* The last image copied to the external frame buffer (RGBA8, GCN_EFB_W wide). */
+/* The last image copied to the external frame buffer (RGBA8, rows gcn_gpu_frame_stride()
+ * pixels apart), at the render resolution it was drawn at (gcn_gpu_frame_scale() x the
+ * game's size). */
 const uint32_t *gcn_gpu_frame(int *width, int *height);
+int gcn_gpu_frame_stride(void);
+int gcn_gpu_frame_scale(void);
+/* Render resolution (software GPU): the game is drawn at scale x the console's 640x528 frame
+ * buffer, from its next finished picture on. Copies into textures are filtered back down to
+ * the sizes the game asked for; the picture stays large. 1..gcn_gpu_max_render_scale() (1 on
+ * consoles). GCN_RENDER_SCALE=n sets the starting scale. */
+void gcn_gpu_set_render_scale(int scale);
+int gcn_gpu_render_scale(void);
+int gcn_gpu_max_render_scale(void);
 /* Passthrough hosts (Wii): the GX RGB565 texture (4x4 tiles, 32-byte aligned) that the
  * game's copies to its external frame buffer go to; width and height multiples of 4. Never
  * set (the default), those copies are dropped: the picture stays in the embedded frame

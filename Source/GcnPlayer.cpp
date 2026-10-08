@@ -36,6 +36,7 @@ extern "C" {
 #include "Renderer.h"                // the engine's clear color: the game's
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -459,7 +460,7 @@ void GcnPlayer::EnsureDisplayQuad()
     mBoundQuad = ResolveWeakPtr<Quad>(mDisplayQuad);
 }
 
-void GcnPlayer::UpdateDisplayTexture(const uint8_t* pixels, int width, int height)
+void GcnPlayer::UpdateDisplayTexture(const uint8_t* pixels, int width, int height, int scale)
 {
     if (width <= 0 || height <= 0)
     {
@@ -487,7 +488,7 @@ void GcnPlayer::UpdateDisplayTexture(const uint8_t* pixels, int width, int heigh
             // Stretch (the old property) fills the screen; a Quad the user bound keeps its layout
             quad->SetObjectFit(mStretch ? ObjectFit::Fill : ObjectFit::Contain);
         }
-        else if (Recomp_DisplayApply(quad, texture, width, height, 4.0f / 3.0f, true))
+        else if (Recomp_DisplayApply(quad, texture, width / scale, height / scale, 4.0f / 3.0f, true))
         {
             // the resolution scaler (mod settings "Screen"): the console's 4:3 picture, also
             // for 640x448 copies; a changed filter needs a new texture
@@ -495,8 +496,9 @@ void GcnPlayer::UpdateDisplayTexture(const uint8_t* pixels, int width, int heigh
         }
     }
     texture->UpdatePixels(pixels, size_t(width) * size_t(height) * 4);
-    GcnProvider::Get().SetFrame(width, height);
-    Recomp_DisplayApplyWindow(width, height);
+    // the game's own size (the fit modes and window presets go by it, not the render resolution)
+    GcnProvider::Get().SetFrame(width / scale, height / scale);
+    Recomp_DisplayApplyWindow(width / scale, height / scale);
 }
 
 void GcnPlayer::ShowStatus(const std::vector<std::string>& lines)
@@ -659,6 +661,16 @@ void GcnPlayer::Tick(float deltaTime)
     }
     // mod settings: written to the game once it runs, kept, saved
     ModSettings::Get().Tick(&GcnProvider::Get());
+#if defined(RECOMP_DISPLAY_HAS_RESOLUTION)
+    // "Resolution": the software GPU draws at 640x528 times this, from the game's next picture
+    {
+        const int scale = std::max(1, std::min(Recomp_DisplaySettings().resolution, gcn_gpu_max_render_scale()));
+        if (scale != gcn_gpu_render_scale())
+        {
+            gcn_gpu_set_render_scale(scale);
+        }
+    }
+#endif
     if (!mRunning)
     {
         return;
@@ -737,10 +749,10 @@ void GcnPlayer::Tick(float deltaTime)
 #endif
 
     const uint8_t* rgba = nullptr;
-    int width = 0, height = 0;
-    if (GcnGuestHost::GetFrame(mLastSerial, rgba, width, height))
+    int width = 0, height = 0, scale = 1;
+    if (GcnGuestHost::GetFrame(mLastSerial, rgba, width, height, &scale))
     {
-        UpdateDisplayTexture(rgba, width, height);
+        UpdateDisplayTexture(rgba, width, height, scale);
     }
     PumpAudio();
 }

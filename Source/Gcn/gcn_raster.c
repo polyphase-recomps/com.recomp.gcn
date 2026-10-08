@@ -33,6 +33,18 @@ static float xff(uint32_t addr)
 
 void gcn_raster_init(const GcnGpuRegs *regs) { R = *regs; }
 
+/* render resolution: the EFB is sScale times the console's in each direction */
+static int sScale = 1, sEfbW = GCN_EFB_W, sEfbH = GCN_EFB_H;
+
+void gcn_raster_set_target(uint32_t *efb, uint32_t *depth, int scale)
+{
+    R.efb = efb;
+    R.depth = depth;
+    sScale = scale < 1 ? 1 : scale;
+    sEfbW = GCN_EFB_W * sScale;
+    sEfbH = GCN_EFB_H * sScale;
+}
+
 /* ---- textures -------------------------------------------------------------------------- */
 typedef struct
 {
@@ -850,10 +862,11 @@ static void to_screen(const VtxOut *v, Scr *s)
 {
     float iw = 1.0f / v->w;
     float sx = xff(0x101A), sy = xff(0x101B), sz = xff(0x101C), ox = xff(0x101D), oy = xff(0x101E), oz = xff(0x101F);
+    float scale = (float)sScale;
     int k, i;
 
-    s->x = ox + sx * v->x * iw - 342.0f;
-    s->y = oy + sy * v->y * iw - 342.0f;
+    s->x = (ox + sx * v->x * iw - 342.0f) * scale;
+    s->y = (oy + sy * v->y * iw - 342.0f) * scale;
     s->z = oz + sz * v->z * iw;
     s->iw = iw;
     for (k = 0; k < 2; k++)
@@ -1360,7 +1373,7 @@ static void tri_raster(const PrimState *ps, const TriSetup *t, int band, int ban
         for (y = y0; y <= y1; y++)
         {
             float py = y + 0.5f, xl = (float)t->minx, xr = (float)t->maxx;
-            int x0, x1, row = y * GCN_EFB_W;
+            int x0, x1, row = y * sEfbW;
 
             /* the pixels inside all three edges: w_k(x) = ea*(x + 0.5) + r >= 0 */
             for (k = 0; k < 3; k++)
@@ -1788,15 +1801,17 @@ static void clip_triangle(const VtxOut *a, const VtxOut *b, const VtxOut *c)
 static void setup_state(void)
 {
     static uint32_t serial, epoch, generation;
-    static int valid;
+    static int valid, scale;
     uint32_t gm = BP(0x00), tl = BP(0x20), br = BP(0x21);
 
     /* nothing it reads changed since the last primitive: sCur still holds it */
-    if (valid && serial == gcn_gpu_state_serial && epoch == sEpoch && generation == (uint32_t)sTexGeneration && !sTrace)
+    if (valid && serial == gcn_gpu_state_serial && epoch == sEpoch && generation == (uint32_t)sTexGeneration &&
+        scale == sScale && !sTrace)
         return;
     valid = 1;
     serial = gcn_gpu_state_serial;
     epoch = sEpoch;
+    scale = sScale;
 
     sCur.cull = BITS(gm, 14, 2);
 
@@ -1804,14 +1819,15 @@ static void setup_state(void)
     sCur.sNumChan = BITS(gm, 4, 3);
     sCur.sNumStages = BITS(gm, 10, 4) + 1;
     if (sCur.sNumTex > 8) sCur.sNumTex = 8;
-    sCur.sScX0 = (int)BITS(tl, 12, 11) - 342;
-    sCur.sScY0 = (int)BITS(tl, 0, 11) - 342;
-    sCur.sScX1 = (int)BITS(br, 12, 11) - 342;
-    sCur.sScY1 = (int)BITS(br, 0, 11) - 342;
+    /* inclusive, in render-resolution pixels: console pixel x covers x * scale .. + scale - 1 */
+    sCur.sScX0 = ((int)BITS(tl, 12, 11) - 342) * sScale;
+    sCur.sScY0 = ((int)BITS(tl, 0, 11) - 342) * sScale;
+    sCur.sScX1 = ((int)BITS(br, 12, 11) - 342 + 1) * sScale - 1;
+    sCur.sScY1 = ((int)BITS(br, 0, 11) - 342 + 1) * sScale - 1;
     if (sCur.sScX0 < 0) sCur.sScX0 = 0;
     if (sCur.sScY0 < 0) sCur.sScY0 = 0;
-    if (sCur.sScX1 >= GCN_EFB_W) sCur.sScX1 = GCN_EFB_W - 1;
-    if (sCur.sScY1 >= GCN_EFB_H) sCur.sScY1 = GCN_EFB_H - 1;
+    if (sCur.sScX1 >= sEfbW) sCur.sScX1 = sEfbW - 1;
+    if (sCur.sScY1 >= sEfbH) sCur.sScY1 = sEfbH - 1;
     tev_regs();
     {
         /* textures of the enabled stages, looked up once for the primitive */
@@ -1842,6 +1858,7 @@ static void thick_line(const VtxOut *a, const VtxOut *b, float width)
     int i;
 
     if (a->w <= 0 || b->w <= 0) return;
+    width *= (float)sScale; /* console pixels */
     to_screen(a, &sa);
     to_screen(b, &sb);
     dx = sb.x - sa.x;

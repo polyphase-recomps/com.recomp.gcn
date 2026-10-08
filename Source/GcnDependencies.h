@@ -38,6 +38,9 @@ constexpr const char* kPackageDiscOption = "gcn.packageDisc";
 
 void SetBuildMode(const char* mode);
 void SetPackageDisc(bool package);
+// Packages the unpacked discs (Assets/Recomp/<game>/Disc) or leaves them out, as the setting says
+// (done by SetupAll; before packaging without it).
+void PrepareDiscAssets();
 
 bool SetupAll(const char* decompDir);
 void SetupAllAsync(const char* decompDir);

@@ -86,6 +86,27 @@ WEAK OSTime __OSGetSystemTime(void) { return (OSTime)gcn_host_ticks(); }
 
 /* ---- interrupts: there are none to mask; events are delivered at scheduling points --- */
 
+int gcn_os_interrupts_enabled(void)
+{
+    return sInterruptsEnabled != FALSE;
+}
+
+/* Interrupt handlers (every callback the runtime delivers: retrace, disc, DMA, DSP, GPU) run as
+ * the exception does: interrupts off on entry, the interrupted code's state back on return (the
+ * hardware's rfi). Handlers that enable interrupts inside and disable them before returning
+ * (MusyX's salCallback) otherwise left them off for good. */
+int gcn_os_interrupt_enter(void)
+{
+    const int old = sInterruptsEnabled != FALSE;
+    sInterruptsEnabled = FALSE;
+    return old;
+}
+
+void gcn_os_interrupt_leave(int old)
+{
+    sInterruptsEnabled = old ? TRUE : FALSE;
+}
+
 WEAK BOOL OSDisableInterrupts(void)
 {
     BOOL old = sInterruptsEnabled;

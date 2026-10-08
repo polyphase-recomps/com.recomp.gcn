@@ -20,6 +20,11 @@ typedef struct GcnGpuRegs
     uint32_t *depth;   /* 24-bit */
 } GcnGpuRegs;
 
+/* The frame buffers drawn into from now on: GCN_EFB_W * scale x GCN_EFB_H * scale (the
+ * render resolution; screen coordinates, the scissor and line widths are scaled). Only with
+ * nothing queued (after gcn_raster_flush). */
+void gcn_raster_set_target(uint32_t *efb, uint32_t *depth, int scale);
+
 /* A vertex as it comes out of the vertex loader (before XF). */
 typedef struct GcnVertexIn
 {

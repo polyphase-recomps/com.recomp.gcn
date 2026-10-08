@@ -27,6 +27,23 @@ static int sInEvents;
 
 static void dequeue(OSThread *t);
 
+/* Delivering events (interrupt handlers, callbacks): as the exception, with interrupts off and
+ * the interrupted code's state given back afterwards (gcn_os_interrupt_enter / leave). Not
+ * nested: sInEvents keeps a second delivery out. */
+static int sIrqSaved;
+
+static void events_begin(void)
+{
+    sInEvents = 1;
+    sIrqSaved = gcn_os_interrupt_enter();
+}
+
+static void events_end(void)
+{
+    gcn_os_interrupt_leave(sIrqSaved);
+    sInEvents = 0;
+}
+
 static void add_thread(OSThread *t)
 {
     int i;
@@ -53,10 +70,18 @@ static void remove_thread(OSThread *t)
     }
 }
 
+/* the main thread's stack: the module's own (wasm-ld; the recompiled game runs on it too) */
+extern u8 __stack_low[], __stack_high[];
+
 void gcn_threads_init(void)
 {
     sMainThread.state = OS_THREAD_STATE_RUNNING;
     sMainThread.priority = sMainThread.base = 16;
+    /* games look at their thread's stack (Metroid Prime fills the unused part with a marker
+     * and protects its end): its bounds, as the SDK's __start sets them from the linker's */
+    sMainThread.stackBase = __stack_high;
+    sMainThread.stackEnd = (u32 *)__stack_low;
+    *sMainThread.stackEnd = OS_THREAD_STACK_MAGIC;
     CTX(&sMainThread) = 1; /* host context 0 */
     sCurrent = &sMainThread;
     add_thread(&sMainThread);
@@ -129,14 +154,14 @@ static void schedule(int yield)
             return;
         }
         /* nothing can run: interrupts the GPU raised may wake someone; else wait */
-        sInEvents = 1;
+        events_begin();
         gcn_dvd_poll();
         if (gcn_dsp_poll() + gcn_dispatch_interrupts())
         {
-            sInEvents = 0;
+            events_end();
             continue;
         }
-        sInEvents = 0;
+        events_end();
         gcn_idle();
     }
 }
@@ -182,23 +207,23 @@ static void block(void)
 void gcn_poll_events(void)
 {
     if (sInEvents) return;
-    sInEvents = 1;
+    events_begin();
     gcn_dvd_poll();
     gcn_dsp_poll();
     gcn_dispatch_interrupts();
-    sInEvents = 0;
+    events_end();
 }
 
 /* Nothing can run: wait for the next vertical retrace and deliver what happened. */
 void gcn_idle(void)
 {
     if (sInEvents) gcn_host_fatal("gcn: a callback blocked");
-    sInEvents = 1;
+    events_begin();
     gcn_vi_retrace();
     gcn_dvd_poll();
     gcn_dsp_poll();
     gcn_dispatch_interrupts();
-    sInEvents = 0;
+    events_end();
 }
 
 /* The game spins on memory only an interrupt would change (the host notices repeated
@@ -210,12 +235,22 @@ void gcn_spin_wait(void)
     int n;
 
     if (sInEvents) return;
-    sInEvents = 1;
+    events_begin();
     n = gcn_dvd_poll_count();
     n += gcn_dsp_poll();
     n += gcn_dispatch_interrupts();
     if (!n) gcn_vi_retrace();
-    sInEvents = 0;
+    events_end();
+}
+
+void gcn_interrupt_point(void)
+{
+    if (sInEvents || !gcn_os_interrupts_enabled()) return;
+    events_begin();
+    gcn_dvd_poll();
+    gcn_dsp_poll();
+    gcn_dispatch_interrupts();
+    events_end();
 }
 
 void *gcn_thread_main(void *(*fn)(void *), void *arg)
@@ -312,6 +347,15 @@ void OSWakeupThread(OSThreadQueue *queue)
 
 void OSYieldThread(void)
 {
+    /* no other thread to run: a game yielding in a loop waits for an interrupt (Metroid Prime
+     * yields until the GPU's FIFO breakpoint interrupt has swapped the frame buffers), so let
+     * what is pending happen, else a retrace, as a spinning loop gets */
+    const OSThread *t = sSchedulerOff || sInEvents ? 0 : pick(1);
+    if (t == sCurrent)
+    {
+        gcn_spin_wait();
+        return;
+    }
     schedule(1);
 }
 

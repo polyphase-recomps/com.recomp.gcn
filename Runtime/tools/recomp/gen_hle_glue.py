@@ -161,7 +161,14 @@ def main():
     o.append('/* the wrappers by name: a Live build finds them by the addresses syms.txt gives those names */')
     o.append('const gcnr_named_func gcnr_hle_functions[] = {')
     o += ['    {"%s", hle_%s},' % (n, n) for n in hle if n not in missing]
-    o.append('    {0, 0},\n};')
+    o.append('    {0, 0},\n};\n')
+
+    # recompiled loops' interrupt point (recomp_gcn.c gcnr_loop_any -> hle_entry.c gcn_poll)
+    o.append('/* pending interrupts, when enabled (recomp_gcn.c gcnr_loop_any) */')
+    if 'gcn_poll' in exports:
+        o.append('void gcnr_hle_poll(void)\n{\n    %s(hle());\n}' % exports['gcn_poll'][1])
+    else:
+        o.append('void gcnr_hle_poll(void)\n{\n}')
 
     with open(out_path, 'w', newline='\n') as f:
         f.write('\n'.join(o) + '\n')

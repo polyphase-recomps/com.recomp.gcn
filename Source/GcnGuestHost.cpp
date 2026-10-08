@@ -101,7 +101,7 @@ uint32_t sFrameCount = 0;
 double sGameMs = 0.0, sEngineMs = 0.0; // heartbeat (consoles): time in game frames, between them
 
 std::vector<uint8_t> sFrame; // written by the game thread at each retrace
-int sFrameW = 0, sFrameH = 0;
+int sFrameW = 0, sFrameH = 0, sFrameScale = 1;
 uint32_t sFrameSerial = 0;
 std::vector<std::string> sLogLines;
 
@@ -319,14 +319,16 @@ uint32_t gcnp_retrace(void)
         std::lock_guard<std::mutex> guard(sLock);
         if (pixels != nullptr && w > 0 && h > 0)
         {
-            // rows are GCN_EFB_W pixels apart in the copy the GPU keeps
+            // rows are gcn_gpu_frame_stride() pixels apart in the copy the GPU keeps
+            const size_t stride = size_t(gcn_gpu_frame_stride());
             sFrame.resize(size_t(w) * size_t(h) * 4);
             for (int y = 0; y < h; ++y)
             {
-                memcpy(&sFrame[size_t(y) * size_t(w) * 4], pixels + size_t(y) * GCN_EFB_W, size_t(w) * 4);
+                memcpy(&sFrame[size_t(y) * size_t(w) * 4], pixels + size_t(y) * stride, size_t(w) * 4);
             }
             sFrameW = w;
             sFrameH = h;
+            sFrameScale = gcn_gpu_frame_scale();
             sFrameSerial++;
         }
         sFrameCount++;
@@ -1229,7 +1231,7 @@ bool GcnGuestHost::GetRumble(int port)
     return port >= 0 && port < 4 && sRumble[port];
 }
 
-bool GcnGuestHost::GetFrame(uint32_t& lastSerial, const uint8_t*& rgba, int& width, int& height)
+bool GcnGuestHost::GetFrame(uint32_t& lastSerial, const uint8_t*& rgba, int& width, int& height, int* scale)
 {
     static std::vector<uint8_t> out;
     std::lock_guard<std::mutex> guard(sLock);
@@ -1243,6 +1245,10 @@ bool GcnGuestHost::GetFrame(uint32_t& lastSerial, const uint8_t*& rgba, int& wid
     rgba = out.data();
     width = sFrameW;
     height = sFrameH;
+    if (scale != nullptr)
+    {
+        *scale = sFrameScale;
+    }
     return true;
 }
 
