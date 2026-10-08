@@ -35,6 +35,7 @@ typedef struct
 {
     BOOL mounted;
     s32 result;
+    s32 xferred; /* bytes of the last read / write (CARDGetXferredBytes) */
     CardHeader hdr;
     CARDDir dir[MAX_FILES];
 } Card;
@@ -368,6 +369,7 @@ static s32 transfer(CARDFileInfo *fi, void *buf, s32 length, s32 offset, BOOL wr
     if (!used(d)) return finish(chan, CARD_RESULT_NOFILE);
     if (offset < 0 || length < 0 || (u32)(offset + length) > d->length * SECTOR) return finish(chan, CARD_RESULT_LIMIT);
     if (!io(chan, buf, d->startBlock * SECTOR + (u32)offset, (u32)length, write)) return finish(chan, CARD_RESULT_IOERROR);
+    sCard[chan].xferred = length;
     if (write)
     {
         sCard[chan].dir[fi->fileNo].time = now_seconds();
@@ -424,6 +426,156 @@ s32 CARDFastDelete(s32 chan, s32 fileNo)
     memset(&sCard[chan].dir[fileNo], 0xFF, sizeof(CARDDir));
     return finish(chan, save_dir(chan));
 }
+
+s32 CARDFastDeleteAsync(s32 chan, s32 fileNo, CARDCallback callback)
+{
+    return later(chan, CARDFastDelete(chan, fileNo), callback);
+}
+
+s32 CARDRename(s32 chan, const char *oldName, const char *newName)
+{
+    s32 r = ready(chan);
+    CARDDir *d;
+    int i;
+
+    if (r != CARD_RESULT_READY) return finish(chan, r);
+    if (!oldName[0] || !newName[0] || (u8)oldName[0] == 0xFF || (u8)newName[0] == 0xFF)
+        return finish(chan, CARD_RESULT_FATAL_ERROR);
+    if (strlen(oldName) > CARD_FILENAME_MAX || strlen(newName) > CARD_FILENAME_MAX)
+        return finish(chan, CARD_RESULT_NAMETOOLONG);
+    i = find(chan, oldName);
+    if (i < 0) return finish(chan, CARD_RESULT_NOFILE);
+    if (find(chan, newName) >= 0) return finish(chan, CARD_RESULT_EXIST);
+    d = &sCard[chan].dir[i];
+    strncpy((char *)d->fileName, newName, CARD_FILENAME_MAX);
+    d->time = now_seconds();
+    return finish(chan, save_dir(chan));
+}
+
+s32 CARDRenameAsync(s32 chan, const char *oldName, const char *newName, CARDCallback callback)
+{
+    return later(chan, CARDRename(chan, oldName, newName), callback);
+}
+
+/* The directory entry itself (CARDNet: attributes go through these). Another game's files
+ * can be read when they are public, as the SDK's __CARDAccess / __CARDIsPublic allow. */
+s32 __CARDGetStatusEx(s32 chan, s32 fileNo, CARDDir *dirent);
+s32 __CARDSetStatusEx(s32 chan, s32 fileNo, CARDDir *dirent);
+s32 __CARDSetStatusExAsync(s32 chan, s32 fileNo, CARDDir *dirent, CARDCallback callback);
+
+static s32 access_entry(s32 chan, s32 fileNo, BOOL write)
+{
+    u8 game[4], company[2];
+    const CARDDir *d;
+
+    if (fileNo < 0 || fileNo >= MAX_FILES) return CARD_RESULT_FATAL_ERROR;
+    d = &sCard[chan].dir[fileNo];
+    if (!used(d)) return CARD_RESULT_NOFILE;
+    game_ids(game, company);
+    if (!memcmp(d->gameName, game, 4) && !memcmp(d->company, company, 2)) return CARD_RESULT_READY;
+    return !write && (d->permission & CARD_ATTR_PUBLIC) ? CARD_RESULT_READY : CARD_RESULT_NOPERM;
+}
+
+s32 __CARDGetStatusEx(s32 chan, s32 fileNo, CARDDir *dirent)
+{
+    s32 r = ready(chan);
+
+    if (r == CARD_RESULT_READY) r = access_entry(chan, fileNo, FALSE);
+    if (r == CARD_RESULT_READY) memcpy(dirent, &sCard[chan].dir[fileNo], sizeof(CARDDir));
+    return finish(chan, r);
+}
+
+s32 __CARDSetStatusEx(s32 chan, s32 fileNo, CARDDir *dirent)
+{
+    s32 r = ready(chan);
+    CARDDir *d;
+    int i;
+
+    if (r == CARD_RESULT_READY) r = access_entry(chan, fileNo, TRUE);
+    if (r != CARD_RESULT_READY) return finish(chan, r);
+    if (dirent->fileName[0] == 0xFF || dirent->fileName[0] == 0) return finish(chan, CARD_RESULT_FATAL_ERROR);
+    d = &sCard[chan].dir[fileNo];
+    for (i = 0; i < MAX_FILES; i++)
+    {
+        const CARDDir *o = &sCard[chan].dir[i];
+        if (i != fileNo && used(o) && !memcmp(o->gameName, dirent->gameName, 4) &&
+            !memcmp(o->company, dirent->company, 2) &&
+            !strncmp((const char *)o->fileName, (const char *)dirent->fileName, CARD_FILENAME_MAX))
+            return finish(chan, CARD_RESULT_EXIST);
+    }
+    /* where the file's blocks are stays this card's business */
+    {
+        u16 start = d->startBlock, length = d->length;
+        memcpy(d, dirent, sizeof(CARDDir));
+        d->startBlock = start;
+        d->length = length;
+    }
+    return finish(chan, save_dir(chan));
+}
+
+s32 __CARDSetStatusExAsync(s32 chan, s32 fileNo, CARDDir *dirent, CARDCallback callback)
+{
+    return later(chan, __CARDSetStatusEx(chan, fileNo, dirent), callback);
+}
+
+s32 CARDGetAttributes(s32 chan, s32 fileNo, u8 *attr)
+{
+    CARDDir d;
+    s32 r = __CARDGetStatusEx(chan, fileNo, &d);
+
+    if (r == CARD_RESULT_READY) *attr = d.permission;
+    return r;
+}
+
+s32 CARDSetAttributes(s32 chan, s32 fileNo, u8 attr)
+{
+    CARDDir d;
+    s32 r = __CARDGetStatusEx(chan, fileNo, &d);
+
+    if (r != CARD_RESULT_READY) return r;
+    d.permission = attr;
+    return __CARDSetStatusEx(chan, fileNo, &d);
+}
+
+s32 CARDSetAttributesAsync(s32 chan, s32 fileNo, u8 attr, CARDCallback callback)
+{
+    return later(chan, CARDSetAttributes(chan, fileNo, attr), callback);
+}
+
+s32 CARDGetXferredBytes(s32 chan) { return chan >= 0 && chan < 2 ? sCard[chan].xferred : 0; }
+
+s32 CARDGetEncoding(s32 chan, u16 *encode)
+{
+    s32 r = ready(chan);
+
+    if (r == CARD_RESULT_READY) *encode = 0; /* ANSI (the image is formatted that way) */
+    return finish(chan, r);
+}
+
+s32 CARDGetMemSize(s32 chan, u16 *size)
+{
+    s32 r = ready(chan);
+
+    if (r == CARD_RESULT_READY) *size = (u16)(BLOCKS * SECTOR >> 17); /* in Mbit */
+    return finish(chan, r);
+}
+
+s32 CARDGetCurrentMode(s32 chan, u32 *mode)
+{
+    s32 r = ready(chan);
+
+    if (r == CARD_RESULT_READY) *mode = 0; /* CARD_MODE_NORMAL */
+    return finish(chan, r);
+}
+
+static BOOL sFastMode;
+BOOL CARDSetFastMode(BOOL enable)
+{
+    BOOL was = sFastMode;
+    sFastMode = enable;
+    return was;
+}
+BOOL CARDGetFastMode(void) { return sFastMode; }
 
 /* where the banner, icons and data sit in the file (the SDK's __CARDUpdateIconOffsets) */
 static void icon_offsets(const CARDDir *d, CARDStat *stat)

@@ -97,6 +97,98 @@ def calls(words, addr):
     return out
 
 
+def address_loads(words):
+    """the addresses lis / addi (or ori) pairs build"""
+    hi, out = {}, set()
+    for w in words:
+        op, d, a, imm = w >> 26, (w >> 21) & 31, (w >> 16) & 31, w & 0xFFFF
+        if op == 15 and a == 0:
+            hi[d] = imm << 16
+        elif op == 14 and a in hi:
+            out.add((hi[a] + (imm - 0x10000 if imm & 0x8000 else imm)) & 0xFFFFFFFF)
+        elif op == 24 and d in hi:  # ori rA,rS,lo: rS is d's field
+            out.add(hi[d] | imm)
+    return out
+
+
+def by_rules(tfun, twords, final, unnamed):
+    """Names SDK functions the reference game may lack (an SDK library links only what a game
+    calls), from what they call. The runtime replaces them (runtime/guest/sdk), so a game whose
+    own copy runs instead sees state the runtime never set up (e.g. CARD: no card)."""
+    def name(x):
+        n = final.get(x, tfun[x][0] if x in tfun else None)
+        return None if n is None or unnamed(n) else n
+    by_name = {}
+    for x in tfun:
+        if name(x):
+            by_name.setdefault(name(x), x)
+    used = {name(x) for x in tfun if name(x)}
+
+    def has(s, *names):
+        return all(n in s for n in names)
+
+    def rule(t, w):
+        seq = [name(x) for _, x in calls(w, t) if x in tfun and x != t]
+        known = [n for n in seq if n]
+        s = set(known)
+        size = tfun[t][1]
+        # the synchronous wrapper of an asynchronous CARD call: XAsync(..., __CARDSyncCallback), __CARDSync
+        if len(seq) == 2 and seq[1] == '__CARDSync' and seq[0] and seq[0].endswith('Async') and size <= 0x80:
+            cb = by_name.get('__CARDSyncCallback')
+            if cb is None or cb in address_loads(w):
+                return 'CARDFormat' if seq[0] == '__CARDFormatRegionAsync' else seq[0][:-5]
+        if s == {'__CARDGetControlBlock', '__CARDGetDirBlock', '__CARDAccess', '__CARDIsPublic', 'memcpy',
+                 '__CARDPutControlBlock'} and known.count('memcpy') == 1:
+            return '__CARDGetStatusEx'
+        if has(s, '__CARDGetDirBlock', '__CARDCompareFileName', '__CARDAccess', 'strncpy', '__CARDUpdateDir'):
+            return 'CARDRenameAsync'
+        if has(s, '__CARDGetControlBlock', '__CARDGetDirBlock', '__CARDAccess', '__CARDUpdateDir', 'memcmp', 'memcpy') \
+                and not s & {'__CARDCompareFileName', 'UpdateIconOffsets', '__CARDUpdateIconOffsets', 'strncpy',
+                             '__CARDIsOpened', '__CARDGetFileNo', 'OSGetTime'}:
+            return '__CARDSetStatusExAsync'
+        if has(s, '__CARDGetFileNo', '__CARDIsOpened', '__CARDUpdateDir'):
+            return 'CARDDeleteAsync'
+        if has(s, '__CARDGetDirBlock', '__CARDAccess', '__CARDIsOpened', '__CARDUpdateDir'):
+            return 'CARDFastDeleteAsync'
+        if known == ['__CARDGetStatusEx', '__CARDSetStatusExAsync']:
+            return 'CARDSetAttributesAsync'
+        if known == ['__CARDGetStatusEx'] and size <= 0x60:
+            return 'CARDGetAttributes'
+        if '__CARDSetDiskID' in s and 'OSRegisterResetFunction' in s:
+            return 'CARDInit'
+        # cards[chan].xferred: mulli rX,r3,sizeof(CARDControl) ... lwz r3,0xB8(r3); blr
+        if not seq and len(w) == 6 and (w[0] & 0xFC1FFFFF) == 0x1C030110 and 0x806300B8 in w and w[-1] == 0x4E800020:
+            return 'CARDGetXferredBytes'
+        return None
+
+    total = 0
+    for _ in range(4):  # a name found makes callers' rules match (sync wrappers)
+        found = 0
+        for t, w in twords.items():
+            if name(t):
+                continue
+            n = rule(t, w)
+            if n and n not in used:
+                final[t] = n
+                used.add(n)
+                by_name[n] = t
+                found += 1
+        total += found
+        if not found:
+            break
+    return total
+
+
+def card_leftovers(tfun, final, unnamed):
+    """unnamed functions between the first and last named CARD function"""
+    named = [x for x in tfun if not unnamed(final.get(x, tfun[x][0]))
+             and re.match(r'^(__)?CARD', final.get(x, tfun[x][0]))]
+    if not named:
+        return []
+    lo, hi = min(named), max(named)
+    return sorted(x for x in tfun if lo < x < hi and unnamed(final.get(x, tfun[x][0])))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--ref-dol', required=True)
@@ -288,6 +380,13 @@ def main():
         if not found:
             break
     print('gcn_sdkmatch: %d more named by the functions they call' % by_callee_count)
+
+    ruled = by_rules(tfun, twords, final, unnamed)
+    print('gcn_sdkmatch: %d more named by SDK rules (functions the reference game does not have)' % ruled)
+    left = card_leftovers(tfun, final, unnamed)
+    if left:
+        print('gcn_sdkmatch: unnamed functions inside the CARD library (the game\'s own code runs for them, '
+              'which finds no card): ' + ', '.join('%08X' % x for x in left))
 
     with open(a.out, 'w', newline='\n') as f:
         f.write('# gcn_sdkmatch.py: names for unnamed functions, matched against %s\n' % a.ref_symbols.replace('\\', '/'))
