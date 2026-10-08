@@ -94,10 +94,18 @@ if(GCN_RECOMP_RUNNER)
         ${GCN_SOURCE}/gcnw_rt.c
         ${GCN_SOURCE}/gcn_gpu.c
         ${GCN_SOURCE}/gcn_raster.c
+        ${GCN_SOURCE}/gcn_vk.c
         ${GCN_SOURCE}/gcn_thp.c
         ${GCN_SOURCE}/gcn_overlay.c
         ${GCN_SOURCE}/gcn_disc.c)
     target_include_directories(gcn_recomp_runner PRIVATE "${GCN_SOURCE}" "${GCN_HLE_DIR}")
+# the host GPU renderer (gcn_vk.c) needs the Vulkan headers (the Vulkan SDK); without them it
+# compiles to nothing and the software rasteriser draws
+if(DEFINED ENV{VULKAN_SDK} AND EXISTS "$ENV{VULKAN_SDK}/Include/vulkan/vulkan.h")
+    target_include_directories(gcn_recomp_runner PRIVATE "$ENV{VULKAN_SDK}/Include")
+elseif(DEFINED ENV{VULKAN_SDK} AND EXISTS "$ENV{VULKAN_SDK}/include/vulkan/vulkan.h")
+    target_include_directories(gcn_recomp_runner PRIVATE "$ENV{VULKAN_SDK}/include")
+endif()
     target_compile_definitions(gcn_recomp_runner PRIVATE GCN_GUEST_MODULE=gcnw_module_${GCN_HLE_NAME})
     target_link_libraries(gcn_recomp_runner PRIVATE ${LIB})
     set_target_properties(gcn_recomp_runner PROPERTIES OUTPUT_NAME "${GCN_HLE_NAME}_runner")

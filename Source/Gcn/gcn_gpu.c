@@ -24,6 +24,7 @@
 #include "gcn_gpu.h"
 #include "gcn_raster.h"
 #include "gcn_overlay.h"
+#include "gcn_vk.h"
 #include "gcnw.h"
 
 #if defined(GEKKO)
@@ -58,6 +59,7 @@ uint32_t gcn_gpu_tev_color[4][2], gcn_gpu_tev_konst[4][2];
 /* changes with every BP write and XF register write: the rasteriser decodes its per-
  * primitive state again only when this moved (matrix and light memory is read per vertex) */
 uint32_t gcn_gpu_state_serial;
+uint32_t gcn_gpu_xf_serial; /* counts XF writes (registers and memory): gcn_raster.c's GPU transform state */
 static uint32_t sCP[256];
 static uint32_t sBP[256];
 static uint32_t sXF[0x1100];      /* XF memory (matrices 0x000-0x4FF, lights 0x600-) and registers 0x1000- */
@@ -71,9 +73,40 @@ static uint32_t sPiRegs[0x40];    /* processor interface MMIO */
 static uint32_t sPending;
 static uint16_t sToken;
 static int sBreakpointHit;
-#define TOKEN_QUEUE 8
+/* Draw-sync tokens the GPU has passed and the PE token register doesn't show yet. Commands run
+ * the moment they are written, far ahead of where a console's GPU would be, so the register
+ * shows them one per vertical retrace (with the token interrupt), as the console's GPU paces
+ * them: Star Fox Adventures reads it at each retrace and flips its buffers only when it is the
+ * last one + 1. A game that waits for a token in a loop (Metroid Prime, GXReadDrawSync) reads
+ * the same value over and over before the next retrace comes: every SPIN_READS such reads the
+ * register moves on by one token. Those steps raise no interrupt of their own (F-Zero GX broke
+ * on token interrupts in the middle of its polling); the next retrace raises it. A full queue
+ * drops its oldest token, never the newest.
+ * GCN_TOKENS_PER_RETRACE=1: no steps (only one per retrace). */
+#define TOKEN_QUEUE 64
+#define SPIN_READS 16
 static uint16_t sTokens[TOKEN_QUEUE];
-static int sTokenHead, sTokenCount;
+static int sTokenHead, sTokenCount, sTokenReads, sTokenStepped;
+
+static void token_push(uint16_t val)
+{
+    if (sTokenCount ? sTokens[(sTokenHead + sTokenCount - 1) % TOKEN_QUEUE] == val : sToken == val) return;
+    if (sTokenCount == TOKEN_QUEUE)
+    {
+        sTokenHead = (sTokenHead + 1) % TOKEN_QUEUE;
+        sTokenCount--;
+    }
+    sTokens[(sTokenHead + sTokenCount) % TOKEN_QUEUE] = val;
+    sTokenCount++;
+}
+
+static void token_pop(void)
+{
+    sToken = sTokens[sTokenHead];
+    sPeRegs[0x0E / 2] = sToken;
+    sTokenHead = (sTokenHead + 1) % TOKEN_QUEUE;
+    sTokenCount--;
+}
 
 static int tokens_per_retrace(void)
 {
@@ -88,14 +121,14 @@ static int tokens_per_retrace(void)
 
 void gcn_gpu_retrace(void)
 {
+    sTokenReads = 0;
     if (sTokenCount)
     {
-        sToken = sTokens[sTokenHead];
-        sPeRegs[0x0E / 2] = sToken;
-        sTokenHead = (sTokenHead + 1) % TOKEN_QUEUE;
-        sTokenCount--;
-        sPending |= 1u << 18;
+        token_pop();
+        sTokenStepped = 1;
     }
+    if (sTokenStepped) sPending |= 1u << 18; /* a token was passed since the last retrace */
+    sTokenStepped = 0;
 }
 
 /* ---- frame buffers ------------------------------------------------------------------------ */
@@ -110,22 +143,31 @@ static GcnGpuStats sStats, sLastStats;
  * its own size and scale until the next display copy. */
 #if GCN_GPU_PASSTHROUGH || defined(__3DS__)
 #define MAX_RENDER_SCALE 1
+#define MAX_RENDER_SCALE_HW 1
 #else
 /* the software rasteriser's cost grows with the pixels: Metroid Prime on a 24-thread i7-13700K
- * takes 6 ms a frame at 1x, 13 at 2x, 27 at 3x, 47 at 4x (60 fps needs 16.7). Works up to 4. */
+ * takes 6 ms a frame at 1x, 13 at 2x, 27 at 3x, 47 at 4x (60 fps needs 16.7). Works up to 4.
+ * Drawn by the host's GPU (gcn_vk.c), the pixels cost next to nothing. */
 #define MAX_RENDER_SCALE 2
+#define MAX_RENDER_SCALE_HW 4
 #endif
 static int sScale = 1, sEfbW = GCN_EFB_W, sEfbH = GCN_EFB_H;
 static volatile int sScaleWanted = 1;
 static int sDisplayStride = GCN_EFB_W, sDisplayScale = 1;
 static size_t sDisplayCap;
 
+/* the host's GPU draws (gcn_vk.c): -1 = not decided (GCN_GPU, else software) */
+static int sHostGpuWanted = -1, sHostGpu;
+
+void gcn_gpu_use_host_gpu(int on) { sHostGpuWanted = on ? 1 : 0; }
+int gcn_gpu_host_gpu_active(void) { return sHostGpu; }
+
 void gcn_gpu_set_render_scale(int scale)
 {
-    sScaleWanted = scale < 1 ? 1 : scale > MAX_RENDER_SCALE ? MAX_RENDER_SCALE : scale;
+    sScaleWanted = scale < 1 ? 1 : scale > MAX_RENDER_SCALE_HW ? MAX_RENDER_SCALE_HW : scale;
 }
 int gcn_gpu_render_scale(void) { return sScaleWanted; }
-int gcn_gpu_max_render_scale(void) { return MAX_RENDER_SCALE; }
+int gcn_gpu_max_render_scale(void) { return sHostGpu ? MAX_RENDER_SCALE_HW : MAX_RENDER_SCALE; }
 int gcn_gpu_frame_stride(void) { return sDisplayStride; }
 int gcn_gpu_frame_scale(void) { return sDisplayScale; }
 
@@ -142,6 +184,18 @@ void gcn_gpu_init(uint8_t *guest_mem)
         sDisplay = (uint32_t *)calloc(GCN_EFB_W * GCN_EFB_H, 4);
         sDisplayCap = (size_t)GCN_EFB_W * GCN_EFB_H;
         if (e) gcn_gpu_set_render_scale(atoi(e));
+    }
+    {
+        /* the host's GPU: GCN_GPU=1 / 0 overrides what the host asked for */
+        const char *g = getenv("GCN_GPU");
+        int want = g ? (atoi(g) != 0 || g[0] == 'v' || g[0] == 'V') : sHostGpuWanted > 0;
+        if (sHostGpu) gcn_vk_reset(); /* a restarted game */
+        if (want && !sHostGpu)
+        {
+            sHostGpu = gcn_vk_init(sEfbW, sEfbH);
+            if (!sHostGpu) fprintf(stderr, "gcn gpu: the host GPU is not used (%s): software rasteriser\n", gcn_vk_status());
+        }
+        gcn_raster_set_hw(sHostGpu);
     }
 #endif
     memset(sCP, 0, sizeof(sCP));
@@ -277,6 +331,11 @@ static uint32_t efb_texel(int x, int y, int depth)
     return ((z >> 16) & 0xFF) | (((z >> 8) & 0xFF) << 8) | ((z & 0xFF) << 16) | (((z >> 16) & 0xFF) << 24);
 }
 
+/* the host GPU's copy sources, already shrunk to the console's resolution (gcn_vk_read_shrunk;
+ * GCN_EFB_W wide), while sCopyNative */
+static uint32_t *sNatColor, *sNatDepth;
+static int sCopyNative;
+
 /* ... at the console's resolution: above 1x the average of the scale x scale pixels it
  * covers (depth: the middle one, depth values don't average) */
 static uint32_t copy_texel(int x, int y, int depth)
@@ -285,6 +344,13 @@ static uint32_t copy_texel(int x, int y, int depth)
     uint32_t r = 0, g = 0, b = 0, a = 0, n;
     int i, j;
 
+    if (sCopyNative)
+    {
+        uint32_t z;
+        if (!depth) return sNatColor[y * GCN_EFB_W + x];
+        z = sNatDepth[y * GCN_EFB_W + x];
+        return ((z >> 16) & 0xFF) | (((z >> 8) & 0xFF) << 8) | ((z & 0xFF) << 16) | (((z >> 16) & 0xFF) << 24);
+    }
     if (s == 1) return efb_texel(x, y, depth);
     if (depth) return efb_texel(x * s + s / 2, y * s + s / 2, 1);
     for (j = 0; j < s; j++)
@@ -307,7 +373,8 @@ static uint32_t copy_texel(int x, int y, int depth)
  * contents over */
 static void apply_render_scale(void)
 {
-    const int n = sScaleWanted, w = GCN_EFB_W * n, h = GCN_EFB_H * n;
+    const int n = sScaleWanted < gcn_gpu_max_render_scale() ? sScaleWanted : gcn_gpu_max_render_scale();
+    const int w = GCN_EFB_W * n, h = GCN_EFB_H * n;
     uint32_t *efb, *depth;
     int x, y;
 
@@ -340,6 +407,7 @@ static void apply_render_scale(void)
     sEfbW = w;
     sEfbH = h;
     gcn_raster_set_target(sEfb, sDepth, sScale);
+    if (sHostGpu) gcn_vk_resize(w, h); /* the CPU copy above is only what the copies read back */
 }
 
 /* the copy's source image, ow x oh: half-scale copies box-filter 2x2 (four channels at
@@ -413,7 +481,21 @@ static void efb_copy_to_texture(uint32_t cmd, int x0, int y0, int w, int h)
     bytes = bw * bh * bpp / 8;
     if (!stride) stride = (uint32_t)(((ow + bw - 1) / bw) * bytes);
     if (fmt == 0x6 && stride < (uint32_t)(((ow + bw - 1) / bw) * bytes)) stride *= 2;
+    if (sHostGpu)
+    {
+        /* the pixels the copy reads, from the GPU, shrunk there to the console's resolution */
+        const int s = sScale;
+        if (!sNatColor)
+        {
+            sNatColor = (uint32_t *)calloc((size_t)GCN_EFB_W * GCN_EFB_H, 4);
+            sNatDepth = (uint32_t *)calloc((size_t)GCN_EFB_W * GCN_EFB_H, 4);
+        }
+        gcn_vk_read_shrunk(x0 * s, y0 * s, (x1 + 1) * s, (y1 + 1) * s, s, depth ? NULL : sNatColor,
+                           depth ? sNatDepth : NULL, GCN_EFB_W);
+        sCopyNative = 1;
+    }
     copy_source(x0, y0, x1, y1, ow, oh, half, depth, alpha || depth);
+    sCopyNative = 0;
     if (getenv("GCN_TRACE_COPIES"))
         fprintf(stderr, "efb copy %d,%d %dx%d -> %08X %dx%d fmt %X stride %u%s%s%s pe %d\n", x0, y0, w, h, (unsigned)dst, ow, oh,
                 fmt, (unsigned)stride, half ? " half" : "", intensity ? " intensity" : "", (cmd >> 11) & 1 ? " clear" : "", pefmt);
@@ -546,16 +628,25 @@ static void efb_copy(uint32_t cmd)
          * with 0: the host's Quad, which blends by alpha, showed nothing) */
         if (dh > 0)
         {
-            for (y = 0; y < dh && y0 * s + y < sEfbH; y++)
+            if (sHostGpu)
             {
-                uint32_t *dst = &sDisplay[(size_t)y * dw];
-                const uint32_t *srow = &sEfb[(y0 * s + y) * sEfbW + x0 * s];
-                for (x = 0; x < dw; x++) dst[x] = srow[x] | 0xFF000000u;
+                /* straight from the GPU into the picture (made opaque on the way) */
+                gcn_vk_read_into(x0 * s, y0 * s, x0 * s + dw, y0 * s + dh, sDisplay, dw);
+            }
+            else
+            {
+                for (y = 0; y < dh && y0 * s + y < sEfbH; y++)
+                {
+                    uint32_t *dst = &sDisplay[(size_t)y * dw];
+                    const uint32_t *srow = &sEfb[(y0 * s + y) * sEfbW + x0 * s];
+                    for (x = 0; x < dw; x++) dst[x] = srow[x] | 0xFF000000u;
+                }
             }
             sDisplayW = dw;
             sDisplayH = dh;
             sDisplayStride = dw;
             sDisplayScale = s;
+            sDisplayCopies++; /* a new picture (GcnGuestHost takes it once) */
             gcn_overlay_draw_scaled(sDisplay, dw, dw, dh, s); /* mods' on-screen text */
         }
         sLastStats = sStats;
@@ -574,12 +665,19 @@ static void efb_copy(uint32_t cmd)
 
         const int s = sScale;
 
-        for (y = y0 * s; y < (y0 + h) * s && y < sEfbH; y++)
+        if (sHostGpu)
         {
-            for (x = x0 * s; x < (x0 + w) * s && x < sEfbW; x++)
+            gcn_vk_clear(x0 * s, y0 * s, (x0 + w) * s, (y0 + h) * s, rgba, z, 1, 1);
+        }
+        else
+        {
+            for (y = y0 * s; y < (y0 + h) * s && y < sEfbH; y++)
             {
-                sEfb[y * sEfbW + x] = rgba;
-                sDepth[y * sEfbW + x] = z;
+                for (x = x0 * s; x < (x0 + w) * s && x < sEfbW; x++)
+                {
+                    sEfb[y * sEfbW + x] = rgba;
+                    sDepth[y * sEfbW + x] = z;
+                }
             }
         }
     }
@@ -794,23 +892,9 @@ static void bp_write(uint32_t v)
         break;
     case 0x47: /* token, no interrupt */
     case 0x48: /* token with interrupt */
-        /* Commands run the moment they are written, so the GPU has reached the token now:
-         * the PE register shows it at once (Metroid Prime waits for it in a loop, GXReadDrawSync).
-         * GCN_TOKENS_PER_RETRACE=1: one per vertical retrace instead (gcn_gpu_retrace), for
-         * games that pace their frames on the token. */
-        if (!tokens_per_retrace())
-        {
-            sToken = (uint16_t)val;
-            sPeRegs[0x0E / 2] = sToken;
-            if ((reg == 0x48)) sPending |= 1u << 18;
-            break;
-        }
-        if (sTokenCount && sTokens[(sTokenHead + sTokenCount - 1) % TOKEN_QUEUE] == (uint16_t)val) break;
-        if (sTokenCount < TOKEN_QUEUE)
-        {
-            sTokens[(sTokenHead + sTokenCount) % TOKEN_QUEUE] = (uint16_t)val;
-            sTokenCount++;
-        }
+        /* the GPU has passed the token now (commands run as they are written): queued for the
+         * PE register (see sTokens) */
+        token_push((uint16_t)val);
         break;
     case 0x52:
         efb_copy(val);
@@ -843,7 +927,11 @@ static void xf_write(uint32_t addr, uint32_t value)
         sXF[addr] = value;
         MARK_SET(sXFSet, addr);
     }
-    if (addr >= 0x1000) gcn_gpu_state_serial++;
+    /* the pixel state (gcn_raster.c setup_state) reads XF only for the texture coordinate
+     * generation (0x1040-0x1047) and the dual texture transform enable (0x1012); matrix indices
+     * and the like change with nearly every object */
+    if (addr == 0x1012 || (addr >= 0x1040 && addr <= 0x1047)) gcn_gpu_state_serial++;
+    gcn_gpu_xf_serial++;
 }
 
 static void xf_indexed(int array, uint32_t v)
@@ -1602,6 +1690,13 @@ uint32_t gcn_gpu_reg_read(uint32_t addr, int bytes)
     case 0xCC001000: /* PE */
         if (off == 0x0E)
         {
+            if (sTokenCount && !tokens_per_retrace() && ++sTokenReads >= SPIN_READS)
+            {
+                /* waited for in a loop (sTokens): the next one, its interrupt at the retrace */
+                token_pop();
+                sTokenStepped = 1;
+                sTokenReads = 0;
+            }
             if (trace) fprintf(stderr, "  token %04X (queued %d)\n", sToken, sTokenCount);
             return sToken;
         }

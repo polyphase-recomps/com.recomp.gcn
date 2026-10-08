@@ -20,11 +20,19 @@ add_executable(gcn_runner
     ${GCN_SOURCE}/gcnw_rt.c
     ${GCN_SOURCE}/gcn_gpu.c
     ${GCN_SOURCE}/gcn_raster.c
+    ${GCN_SOURCE}/gcn_vk.c
     ${GCN_SOURCE}/gcn_thp.c
     ${GCN_SOURCE}/gcn_overlay.c
     ${GCN_SOURCE}/gcn_disc.c
     ${GUEST_SOURCES})
 target_include_directories(gcn_runner PRIVATE "${GCN_SOURCE}" "${GCN_GUEST_DIR}")
+# the host GPU renderer (gcn_vk.c) needs the Vulkan headers (the Vulkan SDK); without them it
+# compiles to nothing and the software rasteriser draws
+if(DEFINED ENV{VULKAN_SDK} AND EXISTS "$ENV{VULKAN_SDK}/Include/vulkan/vulkan.h")
+    target_include_directories(gcn_runner PRIVATE "$ENV{VULKAN_SDK}/Include")
+elseif(DEFINED ENV{VULKAN_SDK} AND EXISTS "$ENV{VULKAN_SDK}/include/vulkan/vulkan.h")
+    target_include_directories(gcn_runner PRIVATE "$ENV{VULKAN_SDK}/include")
+endif()
 target_compile_definitions(gcn_runner PRIVATE GCN_GUEST_MODULE=gcnw_module_${GCN_GUEST_NAME})
 # debugging: every guest store checked against GCN_WATCH_WRITE (slow)
 option(GCN_WATCH_WRITES "store watchpoint (GCN_WATCH_WRITE=lo:hi[:value])" OFF)

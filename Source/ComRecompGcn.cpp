@@ -43,7 +43,12 @@ static int OnLoad(PolyphaseEngineAPI* api)
 #if defined(RECOMP_DISPLAY_HAS_RESOLUTION)
     // ... and its software GPU can draw larger than 640x528 (mod settings "Resolution"; 1 on
     // consoles, where nothing is offered)
+#if !PLATFORM_DOLPHIN && !PLATFORM_3DS && !PLATFORM_ANDROID
+    // up to 4x drawn on the GPU (gcn_vk.c); the player clamps to what the renderer it got allows
+    Recomp_SetMaxResolution(4);
+#else
     Recomp_SetMaxResolution(gcn_gpu_max_render_scale());
+#endif
 #endif
     if (api && api->LogDebug)
     {

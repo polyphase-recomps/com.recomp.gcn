@@ -24,6 +24,9 @@ typedef struct GcnGpuRegs
  * render resolution; screen coordinates, the scissor and line widths are scaled). Only with
  * nothing queued (after gcn_raster_flush). */
 void gcn_raster_set_target(uint32_t *efb, uint32_t *depth, int scale);
+/* 1: the host's GPU draws the pixels (gcn_vk.c, initialised by the caller); the CPU transforms,
+ * clips, culls and decodes textures. */
+void gcn_raster_set_hw(int on);
 
 /* A vertex as it comes out of the vertex loader (before XF). */
 typedef struct GcnVertexIn

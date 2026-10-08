@@ -45,6 +45,11 @@ int gcn_gpu_frame_scale(void);
 void gcn_gpu_set_render_scale(int scale);
 int gcn_gpu_render_scale(void);
 int gcn_gpu_max_render_scale(void);
+/* Draw with the host's GPU (Vulkan, gcn_vk.c; Windows / Linux) instead of the software
+ * rasteriser: call before gcn_gpu_init. GCN_GPU=1 / 0 overrides it. Without a usable GPU the
+ * software rasteriser draws. Render scales up to 4 then. */
+void gcn_gpu_use_host_gpu(int on);
+int gcn_gpu_host_gpu_active(void);
 /* Passthrough hosts (Wii): the GX RGB565 texture (4x4 tiles, 32-byte aligned) that the
  * game's copies to its external frame buffer go to; width and height multiples of 4. Never
  * set (the default), those copies are dropped: the picture stays in the embedded frame

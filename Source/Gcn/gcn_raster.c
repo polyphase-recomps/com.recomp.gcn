@@ -15,6 +15,7 @@
 
 #include "gcn_raster.h"
 #include "gcn_gpu.h"
+#include "gcn_vk.h"
 #include "gcnw.h"
 
 static GcnGpuRegs R;
@@ -35,6 +36,17 @@ void gcn_raster_init(const GcnGpuRegs *regs) { R = *regs; }
 
 /* render resolution: the EFB is sScale times the console's in each direction */
 static int sScale = 1, sEfbW = GCN_EFB_W, sEfbH = GCN_EFB_H;
+/* the host's GPU draws the pixels (gcn_vk.c) */
+static int sHw;
+
+static int sHwStateValid;
+static int sHwXfValid;
+void gcn_raster_set_hw(int on)
+{
+    sHw = on;
+    sHwStateValid = 0; /* the GPU's state buffers may have started over (gcn_vk_reset) */
+    sHwXfValid = 0;
+}
 
 void gcn_raster_set_target(uint32_t *efb, uint32_t *depth, int scale)
 {
@@ -54,6 +66,7 @@ typedef struct
     uint32_t epoch; /* sEpoch when the hash was last checked */
     int used;
     int next;       /* next entry in the same lookup bucket, -1 = none */
+    int slot;       /* the host GPU's copy (gcn_vk_texture), -1 = none yet */
 } TexEntry;
 
 #define TEX_CACHE 512
@@ -108,7 +121,11 @@ static void free_textures(void)
     int i;
     gcn_raster_flush();
     sTexGeneration++;
-    for (i = 0; i < sTexCount; i++) free(sTex[i].px);
+    for (i = 0; i < sTexCount; i++)
+    {
+        free(sTex[i].px);
+        if (sTex[i].slot >= 0) gcn_vk_texture_release(sTex[i].slot);
+    }
     sTexCount = 0;
     memset(sTexBucket, 0, sizeof(sTexBucket));
 }
@@ -344,6 +361,11 @@ static TexEntry *texture(int map)
                     t->px = (uint32_t *)malloc((size_t)t->w * t->h * 4);
                     decode(t);
                     t->hash = now;
+                    if (t->slot >= 0)
+                    {
+                        gcn_vk_texture_release(t->slot); /* what was drawn with it keeps it */
+                        t->slot = -1;
+                    }
                 }
                 t->epoch = sEpoch;
             }
@@ -362,6 +384,7 @@ static TexEntry *texture(int map)
         t->tlut = tlut;
         t->tlutfmt = tlutfmt;
         t->px = (uint32_t *)malloc((size_t)w * h * 4);
+        t->slot = -1;
         decode(t);
         t->hash = tex_hash(t);
         t->epoch = sEpoch;
@@ -917,6 +940,7 @@ void gcn_raster_frame_done(void)
         if (stats && sCopies % 60 == 0)
         {
             int b;
+            if (sHw) gcn_vk_print_stats(60);
             fprintf(stderr, "raster: per thread ms:");
             for (b = 0; b < 16; b++) fprintf(stderr, " %.1f", sBandTime[b]);
             fputc('\n', stderr);
@@ -1691,11 +1715,139 @@ void gcn_raster_flush(void)
     sFlushTime += now_ms() - t0;
 }
 
+/* ---- the host's GPU (gcn_vk.c): the state of the primitive's pixels and its triangles ---- */
+static void pack_state(const PrimState *ps, GcnVkState *o)
+{
+    int i, k;
+
+    memset(o, 0, sizeof(*o));
+    o->hdr[0] = ps->sNumStages;
+    o->hdr[1] = ps->chanused | (ps->tcproj << 8);
+    o->hdr[2] = ps->sAF0 | (ps->sAF1 << 3) | (ps->sAOp << 6) | (ps->atest_always << 8);
+    o->hdr[3] = ps->sAR0 | (ps->sAR1 << 8);
+    for (i = 0; i < 4; i++)
+    {
+        o->reg[i][0] = ps->sReg[i].r;
+        o->reg[i][1] = ps->sReg[i].g;
+        o->reg[i][2] = ps->sReg[i].b;
+        o->reg[i][3] = ps->sReg[i].a;
+    }
+    o->fog[0] = ps->fog_type;
+    o->fog[1] = ps->fog_ortho;
+    o->fog[2] = ps->fog_bmag;
+    o->fog[3] = ps->fog_bshift;
+    o->fog[4] = ps->fog_r;
+    o->fog[5] = ps->fog_g;
+    o->fog[6] = ps->fog_b;
+    o->fogf[0] = ps->fog_a;
+    o->fogf[1] = ps->fog_c;
+    for (i = 0; i < 8; i++)
+    {
+        const TexEntry *te = ps->sTexMap[i];
+        o->smp[i][0] = te ? te->slot : -1;
+        o->smp[i][1] = ps->smp[i].w;
+        o->smp[i][2] = ps->smp[i].h;
+        o->smp[i][3] = ps->smp[i].ws | (ps->smp[i].wt << 2) | (ps->smp[i].linear << 4);
+    }
+    for (i = 0; i < ps->sNumStages && i < 16; i++)
+    {
+        const TevStage *st = &ps->sStage[i];
+        int32_t *s = o->stage[i];
+        s[0] = st->texon;
+        s[1] = st->texmap;
+        s[2] = st->texcoord;
+        s[3] = st->chan;
+        s[4] = st->rswap[0] | (st->rswap[1] << 2) | (st->rswap[2] << 4) | (st->rswap[3] << 6) |
+               ((st->tswap[0] | (st->tswap[1] << 2) | (st->tswap[2] << 4) | (st->tswap[3] << 6)) << 8);
+        s[5] = st->kcol.r;
+        s[6] = st->kcol.g;
+        s[7] = st->kcol.b;
+        s[8] = st->kcol.a;
+        for (k = 0; k < 4; k++) s[9 + k] = st->cslot[k] | ((st->ccomp[k][0] == 3) << 4) | (st->aslot[k] << 8);
+        s[13] = st->cop.bias | (st->cop.sub << 2) | (st->cop.scale << 3) | (st->cop.clampv << 5);
+        s[14] = st->aop.bias | (st->aop.sub << 2) | (st->aop.scale << 3) | (st->aop.clampv << 5);
+        s[15] = st->cdest | (st->adest << 4);
+    }
+}
+
+static PrimState sHwLast; /* the state sHwState was made from */
+static uint32_t sHwState;
+static GcnVkPipe sHwPipe;
+
+static void hw_vertex(const Scr *s, uint32_t state, GcnVkVertex *o)
+{
+    int k;
+    o->pos[0] = s->x / (float)sEfbW * 2.0f - 1.0f;
+    o->pos[1] = s->y / (float)sEfbH * 2.0f - 1.0f;
+    o->pos[2] = s->z / 16777216.0f;
+    o->pos[3] = s->iw;
+    memcpy(o->col, s->col, sizeof(o->col));
+    for (k = 0; k < 8; k++)
+    {
+        o->tc[k][0] = s->tc[k][0];
+        o->tc[k][1] = s->tc[k][1];
+        o->tc[k][2] = s->tc[k][2];
+    }
+    o->state = state;
+}
+
+/* the pixel state (and the pipeline's part of it) for what follows, when it changed */
+static void hw_update_state(void)
+{
+    if (sStateDirty || !sHwStateValid)
+    {
+        if (!sHwStateValid || memcmp(&sHwLast, &sCur, sizeof(sCur)) != 0)
+        {
+            GcnVkState packed;
+            pack_state(&sCur, &packed);
+            sHwState = gcn_vk_state(&packed);
+            sHwLast = sCur;
+            sHwStateValid = 1;
+            sHwPipe.blend = (uint8_t)sCur.sBlend;
+            sHwPipe.sf = (uint8_t)sCur.sBlendSF;
+            sHwPipe.df = (uint8_t)sCur.sBlendDF;
+            sHwPipe.sub = (uint8_t)sCur.sBlendSub;
+            sHwPipe.color_upd = (uint8_t)sCur.sColorUpd;
+            sHwPipe.alpha_upd = (uint8_t)sCur.sAlphaUpd;
+            sHwPipe.dst_alpha_on = (uint8_t)sCur.sDstAlphaOn;
+            sHwPipe.dst_alpha = (uint8_t)sCur.sDstAlpha;
+            sHwPipe.no_alpha = sCur.sPeFmt == 0;
+            sHwPipe.ztest = (uint8_t)sCur.sZTest;
+            sHwPipe.zfunc = (uint8_t)sCur.sZFunc;
+            sHwPipe.zupd = (uint8_t)sCur.sZUpd;
+        }
+        sStateDirty = 0;
+    }
+}
+
+static void hw_emit(const Scr *a, const Scr *b, const Scr *c)
+{
+    GcnVkVertex v[3];
+    float area = edge(a, b, c->x, c->y);
+    int cull = sCur.cull;
+
+    /* as tri_setup: degenerate and culled triangles go */
+    if (area == 0.0f || cull == 3 || (cull == 1 && area < 0) || (cull == 2 && area > 0)) return;
+    hw_update_state();
+    hw_vertex(a, sHwState, &v[0]);
+    hw_vertex(b, sHwState, &v[1]);
+    hw_vertex(c, sHwState, &v[2]);
+    {
+        int sc[4] = {sCur.sScX0, sCur.sScY0, sCur.sScX1, sCur.sScY1};
+        gcn_vk_triangle(v, &sHwPipe, sc);
+    }
+}
+
 /* a triangle of the current primitive: queued, or drawn at once */
 static void emit(const Scr *a, const Scr *b, const Scr *c)
 {
     QueuedTri *t;
 
+    if (sHw)
+    {
+        hw_emit(a, b, c);
+        return;
+    }
     if (sThreads < 0) start_threads();
     if (sThreads <= 1 || sTrace)
     {
@@ -1847,6 +1999,16 @@ static void setup_state(void)
         generation = (uint32_t)sTexGeneration;
     }
     setup_pixel_state();
+    if (sHw)
+    {
+        /* the textures the stages sample, on the GPU */
+        int m;
+        for (m = 0; m < 8; m++)
+        {
+            TexEntry *te = sCur.sTexMap[m];
+            if (te && te->slot < 0) te->slot = gcn_vk_texture(te->px, (int)te->w, (int)te->h);
+        }
+    }
     if (!sStateDirty && (sStateCount == 0 || memcmp(&sStates[sStateCount - 1], &sCur, sizeof(sCur)) != 0))
         sStateDirty = 1;
 }
@@ -1889,6 +2051,158 @@ static void thick_line(const VtxOut *a, const VtxOut *b, float width)
     (void)i;
 }
 
+/* ---- the transform on the GPU (gcn_vk_xf.vert): triangles of untransformed vertices ---------- */
+extern uint32_t gcn_gpu_xf_serial;
+static uint32_t sHwXf, sHwXfSerial, sHwXfKey;
+
+/* the XF state of what follows, when the game changed XF (or what it depends on) */
+static void hw_xf_state(void)
+{
+    uint32_t key = (uint32_t)sCur.sNumTex | (uint32_t)sCur.sNumChan << 4 | (uint32_t)sScale << 8;
+    static GcnVkXf x; /* 4 KB: not on the stack */
+    int i, ch, k;
+
+    if (sHwXfValid && sHwXfSerial == gcn_gpu_xf_serial && sHwXfKey == key) return;
+    setup_lighting();
+    memset(&x, 0, sizeof(x));
+    x.misc[0] = XF(0x1018);
+    x.misc[1] = XF(0x1019);
+    x.misc[2] = XF(0x1026);
+    x.misc[3] = (uint32_t)(sCur.sNumTex & 15) | (uint32_t)(sCur.sNumChan & 15) << 4 | (XF(0x1012) & 1) << 8;
+    for (i = 0; i < 8; i++)
+    {
+        x.texgen[i] = XF(0x1040 + i);
+        x.post[i] = XF(0x1050 + i);
+    }
+    for (i = 0; i < 6; i++) x.proj[i] = xff(0x1020 + i);
+    x.vp[0] = xff(0x101A);
+    x.vp[1] = xff(0x101B);
+    x.vp[2] = xff(0x101C);
+    x.vp[3] = xff(0x101D);
+    x.vp[4] = xff(0x101E);
+    x.vp[5] = xff(0x101F);
+    x.vp[6] = 2.0f * (float)sScale / (float)sEfbW;
+    x.vp[7] = 2.0f * (float)sScale / (float)sEfbH;
+    for (ch = 0; ch < 2; ch++)
+    {
+        const ChanSetup *c = &sChan[ch];
+        for (k = 0; k < 4; k++)
+        {
+            x.chan[ch * 2][k] = c->m[k];
+            x.chan[ch * 2 + 1][k] = c->a[k];
+        }
+        x.chanf[ch * 2] = (uint32_t)(c->mat_vtx | c->amb_vtx << 1 | c->alpha_vtx << 2 | c->lit << 3 | c->diffuse << 4 |
+                                     c->atten << 6 | c->spot << 7);
+        x.chanf[ch * 2 + 1] = (uint32_t)(c->lit ? c->nlights : 0);
+        for (i = 0; c->lit && i < c->nlights; i++)
+        {
+            const LightInfo *l = &c->l[i];
+            for (k = 0; k < 3; k++)
+            {
+                x.light[ch][i][0][k] = l->col[k];
+                x.light[ch][i][1][k] = l->pos[k];
+                x.light[ch][i][2][k] = l->dir[k];
+                x.light[ch][i][3][k] = l->k[k];
+            }
+            x.light[ch][i][0][3] = l->a[0];
+            x.light[ch][i][1][3] = l->a[1];
+            x.light[ch][i][2][3] = l->a[2];
+        }
+    }
+    memcpy(x.mtx, &R.xf[0x000], sizeof(x.mtx));
+    memcpy(x.nrm, &R.xf[0x400], sizeof(x.nrm));
+    if (XF(0x1012) & 1) memcpy(x.pmx, &R.xf[0x500], sizeof(x.pmx));
+    sHwXf = gcn_vk_xf_state(&x);
+    sHwXfSerial = gcn_gpu_xf_serial;
+    sHwXfKey = key;
+    sHwXfValid = 1;
+}
+
+static void xf_vertex(const GcnVertexIn *in, GcnVkXfVertex *o)
+{
+    int i;
+    uint32_t lo = 0, hi = 0;
+
+    memcpy(o->pos, in->pos, sizeof(o->pos));
+    o->mtx = in->pnmtx >= 0 ? (uint32_t)in->pnmtx : 0xFFFFFFFFu;
+    memcpy(o->nrm, in->nrm, sizeof(o->nrm));
+    o->flags = (uint32_t)(in->has_nrm ? 1 : 0) | (uint32_t)(in->has_col[0] ? 2 : 0) | (uint32_t)(in->has_col[1] ? 4 : 0);
+    memcpy(o->bin, in->bin, sizeof(o->bin));
+    memcpy(o->tan, in->tan, sizeof(o->tan));
+    for (i = 0; i < 4; i++)
+    {
+        lo |= (uint32_t)(in->texmtx[i] >= 0 ? in->texmtx[i] & 255 : 255) << (i * 8);
+        hi |= (uint32_t)(in->texmtx[4 + i] >= 0 ? in->texmtx[4 + i] & 255 : 255) << (i * 8);
+    }
+    o->texmtx_lo = lo;
+    o->texmtx_hi = hi;
+    memcpy(o->col, in->col, sizeof(o->col));
+    memcpy(o->tex, in->tex, sizeof(o->tex));
+    o->xf = sHwXf;
+    o->state = sHwState;
+    o->pad[0] = o->pad[1] = 0;
+}
+
+/* a triangle primitive (quads, triangles, strip, fan) to the GPU, untransformed: its vertices
+ * once, the triangles as indices */
+static void hw_xf_primitive(int prim, const GcnVertexIn *v, int n)
+{
+    static uint32_t *idx;
+    static int idxCap;
+    int i, m = 0;
+    uint32_t b;
+    GcnVkXfVertex *out;
+    GcnVkPipe pipe;
+    int sc[4];
+
+    if (n < 3) return;
+    if (idxCap < n * 3)
+    {
+        idxCap = n * 3 < 4096 ? 4096 : n * 3;
+        free(idx);
+        idx = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)idxCap);
+    }
+    hw_update_state();
+    hw_xf_state();
+    out = gcn_vk_xf_begin(n, &b);
+    if (!out) return;
+    for (i = 0; i < n; i++) xf_vertex(&v[i], &out[i]);
+#define TRI(p, q, r) do { idx[m++] = b + (uint32_t)(p); idx[m++] = b + (uint32_t)(q); idx[m++] = b + (uint32_t)(r); } while (0)
+    switch (prim)
+    {
+    case 0x80: /* quads */
+    case 0x88:
+        for (i = 0; i + 3 < n; i += 4)
+        {
+            TRI(i, i + 1, i + 2);
+            TRI(i, i + 2, i + 3);
+        }
+        break;
+    case 0x90: /* triangles */
+        for (i = 0; i + 2 < n; i += 3) TRI(i, i + 1, i + 2);
+        break;
+    case 0x98: /* strip */
+        for (i = 0; i + 2 < n; i++)
+        {
+            if (i & 1) TRI(i + 1, i, i + 2);
+            else TRI(i, i + 1, i + 2);
+        }
+        break;
+    default: /* 0xA0 fan */
+        for (i = 1; i + 1 < n; i++) TRI(0, i, i + 1);
+        break;
+    }
+#undef TRI
+    pipe = sHwPipe;
+    pipe.cull = (uint8_t)sCur.cull;
+    pipe.clip_off = (uint8_t)(XF(0x1005) & 1);
+    sc[0] = sCur.sScX0;
+    sc[1] = sCur.sScY0;
+    sc[2] = sCur.sScX1;
+    sc[3] = sCur.sScY1;
+    gcn_vk_xf_end(idx, m, &pipe, sc);
+}
+
 void gcn_raster_primitive(int prim, const GcnVertexIn *v, int count)
 {
 #if defined(GEKKO) || defined(__3DS__)
@@ -1908,6 +2222,21 @@ void gcn_raster_primitive(int prim, const GcnVertexIn *v, int count)
     }
     double t0 = now_ms();
     setup_state();
+    /* the GPU transforms triangles itself (GCN_GPU_XF=0: the CPU does, as for lines and points) */
+    {
+        static int xf = -1;
+        if (xf < 0)
+        {
+            const char *e = getenv("GCN_GPU_XF");
+            xf = !(e && *e && atoi(e) == 0);
+        }
+        if (sHw && xf && !sTrace && prim >= 0x80 && prim <= 0xA0)
+        {
+            hw_xf_primitive(prim, v, n);
+            sPrimTime += now_ms() - t0;
+            return;
+        }
+    }
     setup_lighting();
     for (i = 0; i < n; i++) transform(&v[i], &out[i]);
     sTrZ = sTrA = sTrDrawn = sTrTris = sTrCulled = 0;

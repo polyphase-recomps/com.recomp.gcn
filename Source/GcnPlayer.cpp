@@ -26,6 +26,7 @@ extern "C" {
 #include "Gcn/gcn_disc.h"
 #include "Gcn/gcn_overlay.h"
 #include "Gcn/gcn_gpu.h"
+#include "Gcn/gcn_vk.h"
 #include "Gcn/gcnw_module.h"
 }
 
@@ -327,6 +328,10 @@ bool GcnPlayer::StartGame()
     {
         saves = std::string("Saves/") + baseName;
     }
+#if !PLATFORM_DOLPHIN && !PLATFORM_3DS && !PLATFORM_ANDROID
+    // the host's GPU draws (Vulkan, gcn_vk.c): software rasteriser if it cannot, GCN_GPU=0 forces it
+    gcn_gpu_use_host_gpu(1);
+#endif
     if (!GcnGuestHost::Start(module, ResolvePath(disc), ResolvePath(saves)))
     {
         ShowStatus({std::string(module->title) + " did not start.", "Cannot open the disc or set up the game:",
@@ -340,6 +345,17 @@ bool GcnPlayer::StartGame()
     mFrameTime = 0.0f;
     LogDebug("GcnPlayer: %s started (disc %s, saves %s)", module->title, ResolvePath(disc).c_str(),
              ResolvePath(saves).c_str());
+#if !PLATFORM_DOLPHIN && !PLATFORM_3DS && !PLATFORM_ANDROID
+    if (gcn_gpu_host_gpu_active())
+    {
+        LogDebug("GcnPlayer: drawing on the GPU (%s), Resolution up to %dx", gcn_vk_status(), gcn_gpu_max_render_scale());
+    }
+    else
+    {
+        LogWarning("GcnPlayer: drawing with the software rasteriser (%s), Resolution up to %dx", gcn_vk_status(),
+                   gcn_gpu_max_render_scale());
+    }
+#endif
     return true;
 }
 

@@ -100,9 +100,19 @@ bool sThreadDone = false;
 uint32_t sFrameCount = 0;
 double sGameMs = 0.0, sEngineMs = 0.0; // heartbeat (consoles): time in game frames, between them
 
-std::vector<uint8_t> sFrame; // written by the game thread at each retrace
-int sFrameW = 0, sFrameH = 0, sFrameScale = 1;
+// The game's pictures, triple buffered: the game thread fills sFrames[sFrameWrite] when the game
+// finished a new one (a display copy), then publishes it as sFrameReady; the main thread reads
+// sFrameRead (the newest when it asked) in place until it asks again. The writer never touches
+// the ready or the read buffer, so neither side copies under the lock.
+struct FrameBuffer
+{
+    std::vector<uint8_t> px;
+    int w = 0, h = 0, scale = 1;
+};
+FrameBuffer sFrames[3];
+int sFrameWrite = 0, sFrameReady = -1, sFrameRead = -1;
 uint32_t sFrameSerial = 0;
+uint32_t sFrameCopies = 0xFFFFFFFFu; // gcn_gpu_display_copies() of the last picture taken
 std::vector<std::string> sLogLines;
 
 GcnPad sPads[4];
@@ -315,22 +325,43 @@ uint32_t gcnp_retrace(void)
     uint32_t periods = 1;
     int w = 0, h = 0;
     const uint32_t* pixels = gcn_gpu_frame(&w, &h);
+    const uint32_t copies = gcn_gpu_display_copies();
+    if (pixels != nullptr && w > 0 && h > 0 && copies != sFrameCopies)
     {
-        std::lock_guard<std::mutex> guard(sLock);
-        if (pixels != nullptr && w > 0 && h > 0)
+        // a new picture (the game finished one since the last retrace): into the write buffer,
+        // which only this thread touches; rows are gcn_gpu_frame_stride() pixels apart in the GPU's
+        FrameBuffer& fb = sFrames[sFrameWrite];
+        const size_t stride = size_t(gcn_gpu_frame_stride());
+        fb.px.resize(size_t(w) * size_t(h) * 4);
+        if (stride == size_t(w))
         {
-            // rows are gcn_gpu_frame_stride() pixels apart in the copy the GPU keeps
-            const size_t stride = size_t(gcn_gpu_frame_stride());
-            sFrame.resize(size_t(w) * size_t(h) * 4);
+            memcpy(fb.px.data(), pixels, fb.px.size());
+        }
+        else
+        {
             for (int y = 0; y < h; ++y)
             {
-                memcpy(&sFrame[size_t(y) * size_t(w) * 4], pixels + size_t(y) * stride, size_t(w) * 4);
+                memcpy(&fb.px[size_t(y) * size_t(w) * 4], pixels + size_t(y) * stride, size_t(w) * 4);
             }
-            sFrameW = w;
-            sFrameH = h;
-            sFrameScale = gcn_gpu_frame_scale();
-            sFrameSerial++;
         }
+        fb.w = w;
+        fb.h = h;
+        fb.scale = gcn_gpu_frame_scale();
+        sFrameCopies = copies;
+        std::lock_guard<std::mutex> guard(sLock);
+        sFrameReady = sFrameWrite;
+        sFrameSerial++;
+        for (int i = 0; i < 3; ++i)
+        {
+            if (i != sFrameReady && i != sFrameRead)
+            {
+                sFrameWrite = i;
+                break;
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> guard(sLock);
         sFrameCount++;
 #if PLATFORM_DOLPHIN || PLATFORM_3DS
         {
@@ -996,6 +1027,10 @@ bool GcnGuestHost::Start(const GcnwModule* module, const std::string& discPath, 
     sAudioWrite = sAudioRead = 0;
     sFrameCount = 0;
     sFrameSerial = 0;
+    sFrameWrite = 0;
+    sFrameReady = -1;
+    sFrameRead = -1;
+    sFrameCopies = 0xFFFFFFFFu;
 #if PLATFORM_DOLPHIN
     sRun = false; // waits for the first StepFrame (see GameMain)
 #else
@@ -1233,21 +1268,22 @@ bool GcnGuestHost::GetRumble(int port)
 
 bool GcnGuestHost::GetFrame(uint32_t& lastSerial, const uint8_t*& rgba, int& width, int& height, int* scale)
 {
-    static std::vector<uint8_t> out;
     std::lock_guard<std::mutex> guard(sLock);
 
-    if (sFrameSerial == lastSerial || sFrame.empty())
+    if (sFrameReady < 0 || sFrameSerial == lastSerial)
     {
         return false;
     }
-    out = sFrame;
+    // the newest picture, read in place: the game thread leaves it alone until the next call
+    sFrameRead = sFrameReady;
+    const FrameBuffer& fb = sFrames[sFrameRead];
     lastSerial = sFrameSerial;
-    rgba = out.data();
-    width = sFrameW;
-    height = sFrameH;
+    rgba = fb.px.data();
+    width = fb.w;
+    height = fb.h;
     if (scale != nullptr)
     {
-        *scale = sFrameScale;
+        *scale = fb.scale;
     }
     return true;
 }
