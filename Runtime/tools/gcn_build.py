@@ -269,11 +269,13 @@ class Build:
         for inc in cfg.get('include', []):
             incs.append(os.path.join(pdir, self.fmt(inc)))
             incs.append(os.path.join(self.decomp, self.fmt(inc)))
-        # "sdk_include": Dolphin SDK headers from elsewhere (a decomp that has only some of them;
-        # the runtime's SDK replacement needs dolphin.h): relative to Native/, or absolute;
-        # local.json's wins (this machine's paths)
+        # "sdk_include": other Dolphin SDK headers to use before the runtime's own copy (below):
+        # relative to Native/, or absolute; local.json's wins (this machine's paths)
         for inc in self.local.get('sdk_include') or cfg.get('sdk_include', []):
             incs.append(os.path.join(self.native, self.fmt(inc)))
+        # the runtime's own copy of the Dolphin SDK headers (Runtime/sdk_include, from SFA-Decomp,
+        # CC0), last: what the decomp or the package names comes first
+        incs.append(os.path.join(RUNTIME, 'sdk_include'))
         flags = ['--target=armeb-none-eabi', '-mfloat-abi=soft', '-fno-short-enums', '-O2', '-Xclang', '-disable-llvm-passes', '-S', '-emit-llvm',
                  '-ffreestanding', '-fno-builtin', '-fno-strict-aliasing', '-fwrapv', '-fno-delete-null-pointer-checks',
                  '-fno-vectorize', '-fno-slp-vectorize', '-fcommon', '-fgnu89-inline', '-std=gnu99', '-fshort-wchar',

@@ -70,6 +70,7 @@ Runner: `GCN_GPU=1`, `GCN_RENDER_SCALE=n`, `GCN_SMAA=1`, `GCN_FSR=<w>x<h>`, `GCN
 | `Runtime/tools/` | `gcn_build.py` (driver), `gcn_ir.py`, `gcn_place.py`, `gcn_wasm_to_c.py`, disc tools, patch tools |
 | `Runtime/guest/` | C compiled with the game: SDK replacement, libc, mod API (`bridge.c`) |
 | `Runtime/include/` | headers for game code: `gcn_mod.h` (mods), `gcn_guest.h` (host imports) |
+| `Runtime/sdk_include/` | the Dolphin SDK headers the runtime builds against (from SFA-Decomp, CC0), last on every build's include path: recomp packages need no other decomp's headers |
 | `Runtime/host/` | standalone test runner (`<game>_runner.exe`): headless, frame dumps, scripted input, watch/RAM debugging |
 | `Docs/Modding.md` | mods (C) and scripts (Lua) |
 
