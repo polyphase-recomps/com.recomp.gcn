@@ -492,10 +492,33 @@ static uint32_t hle_stack_below(const gcnr_ctx* c)
     return saved;
 }
 
+uint32_t gcnr_loop_at;
+static const gcnr_ctx* sLoopCtx;
+
+void gcnr_hang_report(void)
+{
+    const gcnr_ctx* c = sLoopCtx;
+    uint8_t* mem = guest_mem();
+    uint32_t sp;
+    int i;
+
+    if (!c) return;
+    logf_("recomp: last loop at %08X, lr %08X r1 %08X r3 %08X r4 %08X r5 %08X r31 %08X", gcnr_loop_at, c->lr,
+          c->r[1], c->r[3], c->r[4], c->r[5], c->r[31]);
+    sp = c->r[1];
+    for (i = 0; i < 24 && sp >= 0x80000000u && sp < 0x81800000u && !(sp & 7u); i++)
+    {
+        sp = gcnr_lw(mem, sp);
+        if (sp < 0x80000000u || sp >= 0x81800000u) break;
+        logf_("recomp:   #%d %08X", i, gcnr_lw(mem, sp + 4));
+    }
+}
+
 void gcnr_loop_poll(uint8_t* mem, gcnr_ctx* c)
 {
     uint32_t saved;
     (void)mem;
+    sLoopCtx = c;
     c->loop = 0;
     saved = hle_stack_below(c);
     gcnr_module()->spin();
@@ -510,6 +533,7 @@ void gcnr_loop_any(uint8_t* mem, gcnr_ctx* c)
 {
     uint32_t saved;
     (void)mem;
+    sLoopCtx = c;
     c->loop = 0;
     saved = hle_stack_below(c);
     gcnr_hle_poll();

@@ -122,3 +122,22 @@ the instructions inline; recompiling takes ~0.3 s.
 - **Idle threads**: a priority-31 thread that never waits (OSSetIdleFunction's) lets time pass
   where it re-enables interrupts: on the console it only runs while everyone else waits.
 - **Disc images**: `.iso`, `.gcm`, `.nkit.iso` and `.ciso` (read directly and unpacked).
+- **Mods replacing game functions**: `gcn_syms.py --runtime-map` counts the package mods' own
+  definitions of game-named functions as replacements (map objects `mods_*`), so a rebuild picks
+  them up without a per-game list script (Pokemon Colosseum's `heroItemDecItemDataId`).
+- **Game log functions**: `log <name>` in a package's names.txt sends a game's printf-style
+  logger to the runtime's `OSReport` (Pokemon Colosseum: `log GSlogWrite`).
+- **JAudio's DSP program** (Pikmin; `GCN_DSP_JAUDIO=1` with `GCN_DSP_MUSYX=0` in gcn_game.json "defines"):
+  the mailbox protocol in audio.c and the program's work in `guest/sdk/jaudio_dsp.c` (64 voices, AFC /
+  PCM from ARAM, stream rings in main RAM, the game's resampling filter, buses, effect delays).
+  JAudio's DSP overload guard must be off (the game package's `Native/mods/compat.c` supplies
+  `BreakLowerActiveDSPchannel`): sub-frames here take no time, so its timings mean nothing.
+- **Preemption** (`GCN_PREEMPT=1`): a thread an interrupt woke that outranks the running one runs at
+  loop interrupt points and spin waits, and interrupts the runtime raises itself are taken before a
+  blocking thread hands over. `GCN_LOOP_RETRACE=n`: a loop polling n times with nothing to deliver
+  lets a retrace happen. `GCN_DVD_SYNC_WAIT=1`: `DVDReadPrio` blocks its thread until the
+  completion is delivered (callbacks that race the main thread, Pikmin's music start).
+- **Jump tables with a spilled base**: the analysis follows a table address stored once to a stack
+  slot and loaded back at the switch (only with the table's symbol).
+- **Hang report**: the runner prints the last recompiled loop's address (Live) and the guest call
+  stack when no retrace came for 5 s.

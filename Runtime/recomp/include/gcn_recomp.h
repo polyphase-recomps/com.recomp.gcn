@@ -115,6 +115,10 @@ void gcnr_sp_changed(uint32_t at, uint32_t callee, uint32_t before, uint32_t aft
 /* every other backward branch: pending interrupts every GCNR_LOOP_LIMIT rounds (when enabled),
  * as the console takes them anywhere; no retrace, no thread switch (gcnr_loop_any) */
 void gcnr_loop_any(uint8_t* mem, gcnr_ctx* c);
+/* the last loop that called gcnr_loop_poll / gcnr_loop_any (Live: its branch address) and its
+ * registers; gcnr_hang_report logs them with the guest call stack (the runner, on a hang) */
+extern uint32_t gcnr_loop_at;
+void gcnr_hang_report(void);
 #define GCNR_LOOP_ANY(mem, c)                                      \
     do                                                             \
     {                                                              \

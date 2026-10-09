@@ -45,10 +45,18 @@ void OSClearContext(OSContext *context) {}
 void OSSetCurrentContext(OSContext *context) { sCurrentContext = context; }
 OSContext *OSGetCurrentContext(void) { return sCurrentContext ? sCurrentContext : &sInterruptContext; }
 
+/* interrupts the SDK replacement raises itself (the DSP's, audio.c) */
+static u32 sRaised;
+
+void gcn_raise_interrupt(int interrupt) { sRaised |= 1u << (interrupt & 31); }
+int gcn_interrupts_raised(void) { return sRaised != 0; }
+
 /* Runs the handlers of the interrupts the host has pending; returns how many ran. */
 int gcn_dispatch_interrupts(void)
 {
-    u32 pending = gcn_host_interrupts();
+    u32 pending = gcn_host_interrupts() | sRaised;
+
+    sRaised = 0;
     int ran = 0, i;
 
     for (i = 0; i < 32 && pending; i++)

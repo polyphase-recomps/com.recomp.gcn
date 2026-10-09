@@ -65,6 +65,146 @@ static void script_parse(const char *text)
 static const char *sDumpDir;
 static int sFrame;
 
+/* --set NAME=VALUE@FRAME: write a variable a mod published (a '.' in VALUE: float);
+ * --request NAME[:A,B,...]@FRAME: call a mod's request; --print-vars A,B,...: their values at
+ * every frame dump (--every). For testing mods without Lua. */
+#define MAX_ACTIONS 64
+static struct
+{
+    int frame, is_request, nargs, is_float;
+    char name[64];
+    int args[8];
+    float f;
+} sActions[MAX_ACTIONS];
+static int sActionCount;
+static const char *sPrintVars;
+
+/* --stick "F:LX,LY,CX,CY:DURATION,...": the main stick and the C-stick (-128..127) from retrace F */
+static struct { int frame, duration, v[4]; } sSticks[64];
+static int sStickCount;
+
+static void stick_parse(const char *text)
+{
+    char *end;
+    while (*text && sStickCount < 64)
+    {
+        int k;
+        sSticks[sStickCount].frame = (int)strtol(text, &end, 10);
+        if (*end != ':') break;
+        text = end + 1;
+        for (k = 0; k < 4; k++)
+        {
+            sSticks[sStickCount].v[k] = (int)strtol(text, &end, 10);
+            text = *end == ',' ? end + 1 : end;
+        }
+        sSticks[sStickCount].duration = *text == ':' ? (int)strtol(text + 1, &end, 10) : 6;
+        if (*text == ':') text = end;
+        sStickCount++;
+        while (*text == ',' || *text == ' ') text++;
+    }
+}
+
+static void action_parse(const char *text, int is_request)
+{
+    char *at, *sep;
+    char buf[256];
+
+    if (sActionCount >= MAX_ACTIONS) return;
+    snprintf(buf, sizeof(buf), "%s", text);
+    at = strrchr(buf, '@');
+    if (!at) return;
+    *at = 0;
+    sActions[sActionCount].frame = atoi(at + 1);
+    sActions[sActionCount].is_request = is_request;
+    sep = strchr(buf, is_request ? ':' : '=');
+    if (sep)
+    {
+        char *s = sep + 1, *end;
+        *sep = 0;
+        if (!is_request && strchr(s, '.'))
+        {
+            sActions[sActionCount].is_float = 1;
+            sActions[sActionCount].f = (float)atof(s);
+        }
+        while (*s && sActions[sActionCount].nargs < 8)
+        {
+            sActions[sActionCount].args[sActions[sActionCount].nargs++] = (int)strtol(s, &end, 10);
+            if (end == s) break;
+            s = end;
+            while (*s == ',') s++;
+        }
+    }
+    snprintf(sActions[sActionCount].name, sizeof(sActions[0].name), "%s", buf);
+    sActionCount++;
+}
+
+static void actions_run(void)
+{
+    int i;
+    for (i = 0; i < sActionCount; i++)
+    {
+        if (sActions[i].frame != sFrame) continue;
+        if (sActions[i].is_request)
+        {
+            gcnw_bridge_request(sActions[i].name, sActions[i].args, sActions[i].nargs);
+        }
+        else
+        {
+            const GcnwBridgeVar *v = gcnw_bridge_find_var(sActions[i].name);
+            if (v && v->type == GCNW_VAR_F32)
+            {
+                float f = sActions[i].is_float ? sActions[i].f : (float)sActions[i].args[0];
+                uint32_t bits;
+                memcpy(&bits, &f, 4);
+                gcnw_write32(v->addr, bits);
+            }
+            else if (v)
+            {
+                gcnw_write32(v->addr, (uint32_t)sActions[i].args[0]);
+            }
+        }
+        {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "gcn_runner: frame %d: %s %s", sFrame, sActions[i].is_request ? "request" : "set",
+                     sActions[i].name);
+            gcnp_log(msg);
+        }
+    }
+}
+
+static void print_vars(void)
+{
+    char msg[1024], name[64];
+    const char *s = sPrintVars;
+    size_t n;
+    int len = snprintf(msg, sizeof(msg), "gcn_runner: frame %d vars:", sFrame);
+
+    while (s && *s && len < (int)sizeof(msg) - 80)
+    {
+        const GcnwBridgeVar *v;
+        n = strcspn(s, ",");
+        if (n >= sizeof(name)) n = sizeof(name) - 1;
+        memcpy(name, s, n);
+        name[n] = 0;
+        s += n;
+        if (*s == ',') s++;
+        v = gcnw_bridge_find_var(name);
+        if (!v) continue;
+        if (v->type == GCNW_VAR_F32)
+        {
+            uint32_t bits = gcnw_read32(v->addr);
+            float f;
+            memcpy(&f, &bits, 4);
+            len += snprintf(msg + len, sizeof(msg) - (size_t)len, " %s=%.2f", name, f);
+        }
+        else
+        {
+            len += snprintf(msg + len, sizeof(msg) - (size_t)len, " %s=%d", name, (int)gcnw_read32(v->addr));
+        }
+    }
+    gcnp_log(msg);
+}
+
 void gcnp_log(const char *text)
 {
     fprintf(stderr, "%s\n", text);
@@ -78,6 +218,10 @@ void gcnp_log(const char *text)
 #ifdef _WIN32
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
+
+#ifdef GCNR_RUNNER
+void gcnr_hang_report(void); /* recomp_gcn.c */
+#endif
 
 /* Native call stack: wasm2c functions are named w2c_<game>_<guest function>. */
 static void backtrace_log(void)
@@ -201,6 +345,9 @@ static DWORD WINAPI watchdog(void *p)
                     snprintf(line, sizeof(line), "  #%d %llx", i, (unsigned long long)sf.AddrPC.Offset);
                 gcnp_log(line);
             }
+#ifdef GCNR_RUNNER
+            gcnr_hang_report();
+#endif
             if (sLog) fflush(sLog);
             ExitProcess(4);
         }
@@ -500,6 +647,8 @@ uint32_t gcnp_retrace(void)
     const GcnGpuStats *st;
 
     sFrame++;
+    actions_run();
+    if (sPrintVars && sDumpDir && sFrame >= sDumpFrom && sFrame % sEvery == 0) print_vars();
     if (sFrame == sStackAt)
     {
         gcnp_log("gcn_runner: call stack at this retrace:");
@@ -562,6 +711,19 @@ int gcnp_pad(int port, GcnPad *pad)
     }
     /* no script: press START now and then to get through menus */
     else if (port == 0 && sFrame > 200 && (sFrame % 120) < 6) pad->buttons = GCN_PAD_START;
+    /* --stick */
+    if (port == 0)
+    {
+        int i;
+        for (i = 0; i < sStickCount; i++)
+            if (sFrame >= sSticks[i].frame && sFrame < sSticks[i].frame + sSticks[i].duration)
+            {
+                pad->stick_x = (int8_t)sSticks[i].v[0];
+                pad->stick_y = (int8_t)sSticks[i].v[1];
+                pad->substick_x = (int8_t)sSticks[i].v[2];
+                pad->substick_y = (int8_t)sSticks[i].v[3];
+            }
+    }
     return pad->connected;
 }
 
@@ -800,6 +962,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--dump-ram") && i + 1 < argc) sRamDump = argv[++i];
         else if (!strcmp(argv[i], "--watch-every") && i + 1 < argc) sWatchEvery = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--script") && i + 1 < argc) script_parse(argv[++i]);
+        else if (!strcmp(argv[i], "--set") && i + 1 < argc) action_parse(argv[++i], 0);
+        else if (!strcmp(argv[i], "--request") && i + 1 < argc) action_parse(argv[++i], 1);
+        else if (!strcmp(argv[i], "--print-vars") && i + 1 < argc) sPrintVars = argv[++i];
+        else if (!strcmp(argv[i], "--stick") && i + 1 < argc) stick_parse(argv[++i]);
         else if (!strcmp(argv[i], "--log") && i + 1 < argc) sLog = fopen(argv[++i], "w");
         else if (!strcmp(argv[i], "--wav") && i + 1 < argc) sWav = fopen(argv[++i], "wb");
         else

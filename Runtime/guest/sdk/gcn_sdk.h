@@ -30,6 +30,9 @@ void gcn_idle_point(void);    /* thread.c: interrupts re-enabled; the idle threa
 
 /* interrupt.c: runs the handlers of pending hardware interrupts; returns how many */
 int gcn_dispatch_interrupts(void);
+/* interrupt.c: makes an interrupt pending, delivered by the next gcn_dispatch_interrupts */
+void gcn_raise_interrupt(int interrupt);
+int gcn_interrupts_raised(void); /* any raised and not yet delivered */
 
 /* vi.c: called at every retrace by the event loop */
 u32 gcn_vi_retrace(void);
@@ -46,5 +49,9 @@ int gcn_dsp_poll(void);
 void gcn_audio_retrace(void);
 /* musyx_dsp.c: the MusyX DSP program's work for one command list (one audio frame) */
 void gcn_musyx_dsp_frame(const u16 *cmd);
+/* jaudio_dsp.c: JAudio's DSP program (audio.c GCN_DSP_JAUDIO speaks its mailbox protocol) */
+void gcn_jaudio_dsp_setup(u32 count, u32 voices, u32 resample, u32 coefs, u32 fx);
+void gcn_jaudio_dsp_frame(u32 subframes, u32 level, u32 start, u32 end);
+void gcn_jaudio_dsp_subframe(void);
 
 #endif /* GCN_SDK_H */

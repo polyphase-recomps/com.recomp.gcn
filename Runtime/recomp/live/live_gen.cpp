@@ -131,7 +131,7 @@ private:
     void jump_local(uint32_t target, sljit_jump* jump = nullptr);
     void cond_false_jumps(const Insn& i, std::vector<sljit_jump*>& out);
     void land(std::vector<sljit_jump*>& jumps);
-    void loop_check(bool spin);
+    void loop_check(bool spin, uint32_t at);
     void loop_checks(const Analysis& an, uint32_t at);
     void unhandled(uint32_t addr, const char* what);
     void ret() { sljit_emit_return_void(C); }
@@ -245,11 +245,12 @@ void LiveGen::land(std::vector<sljit_jump*>& jumps)
 
 // GCNR_LOOP (busy-wait loops: wait for events) / GCNR_LOOP_ANY (any other loop: pending
 // interrupts now and then), as cgen.cpp's loop_check
-void LiveGen::loop_check(bool spin)
+void LiveGen::loop_check(bool spin, uint32_t at)
 {
     sljit_emit_op2(C, SLJIT_ADD32, R0, 0, CM, OFF(loop), IMM, 1);
     sljit_emit_op1(C, SLJIT_MOV32, CM, OFF(loop), R0, 0);
     sljit_jump* low = sljit_emit_cmp(C, SLJIT_LESS | SLJIT_32, R0, 0, IMM, (sljit_sw)GCNR_LOOP_LIMIT);
+    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM0(), (sljit_sw)&gcnr_loop_at, IMM, (sljit_sw)at);
     args_mem_ctx();
     sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2V(P, P), IMM,
                      spin ? SLJIT_FUNC_ADDR(gcnr_loop_poll) : SLJIT_FUNC_ADDR(gcnr_loop_any));
@@ -258,8 +259,8 @@ void LiveGen::loop_check(bool spin)
 
 void LiveGen::loop_checks(const Analysis& an, uint32_t at)
 {
-    if (an.spinLoops.count(at)) loop_check(true);
-    else if (an.backBranches.count(at)) loop_check(false);
+    if (an.spinLoops.count(at)) loop_check(true, at);
+    else if (an.backBranches.count(at)) loop_check(false, at);
 }
 
 void LiveGen::unhandled(uint32_t addr, const char* what)
@@ -912,7 +913,7 @@ void LiveGen::insn(const Analysis& an, const Insn& i)
         {
             // one condition (CTR or a CR bit): straight to the target when it holds (a loop's
             // count goes up on the way out too: harmless)
-            if (an.backBranches.count(i.addr)) loop_check(false);
+            if (an.backBranches.count(i.addr)) loop_check(false, i.addr);
             const int bo = i.bo();
             if (!(bo & 4))
             {

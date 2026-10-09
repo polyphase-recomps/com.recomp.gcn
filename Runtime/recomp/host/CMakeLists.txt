@@ -107,7 +107,7 @@ if(DEFINED ENV{VULKAN_SDK} AND EXISTS "$ENV{VULKAN_SDK}/Include/vulkan/vulkan.h"
 elseif(DEFINED ENV{VULKAN_SDK} AND EXISTS "$ENV{VULKAN_SDK}/include/vulkan/vulkan.h")
     target_include_directories(gcn_recomp_runner PRIVATE "$ENV{VULKAN_SDK}/include")
 endif()
-    target_compile_definitions(gcn_recomp_runner PRIVATE GCN_GUEST_MODULE=gcnw_module_${GCN_HLE_NAME})
+    target_compile_definitions(gcn_recomp_runner PRIVATE GCN_GUEST_MODULE=gcnw_module_${GCN_HLE_NAME} GCNR_RUNNER=1)
     target_link_libraries(gcn_recomp_runner PRIVATE ${LIB})
     set_target_properties(gcn_recomp_runner PROPERTIES OUTPUT_NAME "${GCN_HLE_NAME}_runner")
     if(MSVC)

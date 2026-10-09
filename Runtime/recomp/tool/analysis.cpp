@@ -6,6 +6,8 @@
 
 #include <cstdio>
 #include <deque>
+#include <map>
+#include <set>
 
 using gekko::Insn;
 using gekko::Op;
@@ -431,6 +433,50 @@ Analysis analyze(const Program& program, const Function& fn)
     std::vector<bool> seen;
     auto block_end = [&](size_t b) { return b + 1 < blockStart.size() ? blockStart[b + 1] : n; };
 
+    // Stack slots (offsets from r1) and the constants stored there: a jump table's base the
+    // compiler spilled (lis/addi early, lwz rX,off(r1) at the switch) is found through a slot
+    // stored once, with one constant, and written by nothing else in the function. Only the
+    // jump table search reads them (and only with the table's symbol), not the constant
+    // propagation, so a store through another pointer into the frame cannot mislead codegen.
+    std::map<int32_t, std::set<uint32_t>> slotValues;
+    std::set<int32_t> slotClobbered;
+    bool slotAll = false; // an indexed store into the frame: every slot may change
+    bool slotsChanged = false;
+    auto note_stack_store = [&](const State& s, const Insn& i) {
+        if (i.a != 1 || !gekko::is_load_store(i.op)) return;
+        const std::string m = gekko::mnemonic(i.op);
+        const bool store = (m.size() > 2 && m[0] == 's' && m[1] == 't') || i.op == Op::PsqSt || i.op == Op::PsqStu ||
+                           i.op == Op::PsqStx || i.op == Op::PsqStux || i.op == Op::DcbzL;
+        if (!store || i.op == Op::Stwu) return; // stwu r1: the frame itself
+        const bool xform = (i.word >> 26) == 31 || ((i.word >> 26) == 4 && i.op != Op::PsqL);
+        if (xform)
+        {
+            if (!slotAll) slotsChanged = true;
+            slotAll = true;
+            return;
+        }
+        if (i.op == Op::Stw && s.r[i.d].known)
+        {
+            if (slotValues[i.simm].insert(s.r[i.d].v).second) slotsChanged = true;
+            return;
+        }
+        int size = 8;
+        if (i.op == Op::Stb || i.op == Op::Stbu) size = 1;
+        else if (i.op == Op::Sth || i.op == Op::Sthu) size = 2;
+        else if (i.op == Op::Stw || i.op == Op::Stfs || i.op == Op::Stfsu) size = 4;
+        else if (i.op == Op::Stmw) size = (32 - i.d) * 4;
+        for (int32_t off = i.simm - 3; off < i.simm + size; off++)
+        {
+            if (slotClobbered.insert(off).second) slotsChanged = true;
+        }
+    };
+    auto slot_value = [&](int32_t off, uint32_t& v) {
+        auto it = slotValues.find(off);
+        if (slotAll || it == slotValues.end() || it->second.size() != 1 || slotClobbered.count(off)) return false;
+        v = *it->second.begin();
+        return true;
+    };
+
     auto successors = [&](size_t b, std::vector<size_t>& out) {
         const size_t last = block_end(b) - 1;
         const Insn& i = an.insns[last];
@@ -485,6 +531,7 @@ Analysis analyze(const Program& program, const Function& fn)
             {
                 an.knownEa[i.addr] = ea;
             }
+            note_stack_store(s, i);
             if (i.op == Op::Bcctr && !i.lk && an.switches.count(i.addr) == 0)
             {
                 // lwzx rX,<table>,rI ... mtctr rX ... bctr, with the table address known
@@ -492,6 +539,8 @@ Analysis analyze(const Program& program, const Function& fn)
                 int tableReg = -1;
                 uint32_t table = 0;
                 bool ctrFromTable = false;
+                std::set<int> fromSlot; // registers holding a spilled constant
+                bool tableFromSlot = false;
                 for (size_t q = blockStart[b]; q < k; q++)
                 {
                     const Insn& j = an.insns[q];
@@ -500,11 +549,11 @@ Analysis analyze(const Program& program, const Function& fn)
                         // the table base is whichever operand is a known data address
                         if (j.a != 0 && t.r[j.a].known && !program.in_text(t.r[j.a].v) && (t.r[j.a].v >> 24) == 0x80)
                         {
-                            table = t.r[j.a].v, tableReg = j.d;
+                            table = t.r[j.a].v, tableReg = j.d, tableFromSlot = fromSlot.count(j.a) != 0;
                         }
                         else if (t.r[j.b].known && !program.in_text(t.r[j.b].v) && (t.r[j.b].v >> 24) == 0x80)
                         {
-                            table = t.r[j.b].v, tableReg = j.d;
+                            table = t.r[j.b].v, tableReg = j.d, tableFromSlot = fromSlot.count(j.b) != 0;
                         }
                     }
                     if (j.op == Op::Mtspr && j.spr == 9)
@@ -512,6 +561,20 @@ Analysis analyze(const Program& program, const Function& fn)
                         ctrFromTable = tableReg >= 0 && j.d == tableReg;
                     }
                     transfer(t, j);
+                    for (int r = 0; r < 32; r++)
+                    {
+                        if (gpr_writes(j) & (1u << r)) fromSlot.erase(r);
+                    }
+                    uint32_t spilled = 0;
+                    if (j.op == Op::Lwz && j.a == 1 && slot_value(j.simm, spilled))
+                    {
+                        t.r[j.d] = {true, spilled};
+                        fromSlot.insert(j.d);
+                    }
+                }
+                if (ctrFromTable && tableFromSlot && program.jumpTables.count(table) == 0)
+                {
+                    ctrFromTable = false; // a spilled base counts only with the table's symbol
                 }
                 if (ctrFromTable)
                 {
@@ -572,6 +635,7 @@ Analysis analyze(const Program& program, const Function& fn)
     for (int round = 0; round < 8 && n > 0; round++)
     {
         const size_t switchesBefore = an.switches.size();
+        slotsChanged = false;
         std::vector<bool> leader(n + 1, false);
         leader[0] = true;
         for (size_t k = 0; k < n; k++)
@@ -626,7 +690,7 @@ Analysis analyze(const Program& program, const Function& fn)
                 }
             }
         }
-        if (an.switches.size() == switchesBefore)
+        if (an.switches.size() == switchesBefore && !slotsChanged)
         {
             break;
         }

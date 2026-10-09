@@ -141,7 +141,9 @@ def hle_from_runtime(map_path, src_dir, functions):
     with open(map_path, encoding="utf-8", errors="replace") as f:
         for line in f:
             m = MAP_RE.search(line)
-            if m and m.group(1).startswith("runtime_"):
+            # the runtime's objects, and the package's mods: a mod defining a game function by its
+            # name replaces it (Docs/Modding.md, "Replacing a game function")
+            if m and m.group(1).startswith(("runtime_", "mods_")):
                 runtime.add(m.group(2))
     weak = set()
     if src_dir:

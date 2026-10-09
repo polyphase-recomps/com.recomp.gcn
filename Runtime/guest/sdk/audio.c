@@ -278,12 +278,116 @@ static DSPTaskInfo *sTasks;
 static DSPTaskInfo *sInitPending, *sResumePending;
 static u32 sMailHeader;
 
+/* GCN_DSP_JAUDIO (default 0): the game talks to its own DSP program (JAudio's, Pikmin) through
+ * the mailboxes, not tasks: the boot ROM's handshake (0x8071FEED, then 10 boot mails), a mail
+ * from the program once it runs, then commands (the first word's high byte gives the length)
+ * each answered by one mail, and a lone 0 that releases the program for one sub-frame, which
+ * it ends with the DSP interrupt. The program's work: jaudio_dsp.c. */
+#ifndef GCN_DSP_JAUDIO
+#define GCN_DSP_JAUDIO 0
+#endif
+
+#if GCN_DSP_JAUDIO
+#define JA_OUTBOX 8
+static u32 sJaOut[JA_OUTBOX];
+static int sJaOutHead, sJaOutCount;
+static int sJaState;   /* 0 before the boot ROM's mail, 1 boot mails, 2 the program runs */
+static int sJaWords;   /* boot mails taken, or words left of the current command */
+static u32 sJaCommand; /* the current command's first word */
+static u32 sJaArgs[5]; /* its words */
+static int sJaArg;
+
+static void ja_mail(u32 mail)
+{
+    if (sJaOutCount == JA_OUTBOX) gcn_host_fatal("gcn: DSP mailbox overflow");
+    sJaOut[(sJaOutHead + sJaOutCount++) % JA_OUTBOX] = mail;
+}
+
+u32 DSPCheckMailFromDSP(void)
+{
+    if (sJaState == 0)
+    {
+        sJaState = 1;
+        sJaWords = 0;
+        ja_mail(0x8071FEEDu);
+    }
+    return sJaOutCount ? 0x8000u | (sJaOut[sJaOutHead] >> 16) : 0;
+}
+
+u32 DSPReadMailFromDSP(void)
+{
+    u32 mail;
+
+    if (!sJaOutCount) return 0;
+    mail = sJaOut[sJaOutHead];
+    sJaOutHead = (sJaOutHead + 1) % JA_OUTBOX;
+    sJaOutCount--;
+    return mail;
+}
+
+static int ja_command_words(u32 first)
+{
+    switch (first >> 24)
+    {
+    case 0x80: return 1; /* wait frame */
+    case 0x81: return 5; /* set up the tables */
+    case 0x82: return 3; /* sync frame: sub-frames, mixer level, buffer start and end */
+    case 0x8B:           /* card unlock (IPL, AGB) */
+    case 0x8C: return 2;
+    }
+    OSReport("gcn: unknown JAudio DSP command %08x\n", first);
+    return 1;
+}
+
+static void ja_send(u32 mail)
+{
+    if (sJaState < 2)
+    {
+        if (sJaState == 1 && ++sJaWords == 10)
+        {
+            sJaState = 2;
+            sJaWords = 0;
+            ja_mail(0xDCD10000u); /* the program runs */
+        }
+        return;
+    }
+    if (!sJaWords)
+    {
+        if (!mail)
+        {
+            /* release halt: one sub-frame (jaudio_dsp.c), its end at the next interrupt delivery */
+            gcn_jaudio_dsp_subframe();
+            gcn_raise_interrupt(__OS_INTERRUPT_DSP_DSP);
+            return;
+        }
+        sJaCommand = mail;
+        sJaWords = ja_command_words(mail);
+        sJaArg = 0;
+    }
+    if (sJaArg < 5) sJaArgs[sJaArg++] = mail;
+    if (--sJaWords == 0)
+    {
+        switch (sJaCommand >> 24)
+        {
+        case 0x81: /* voices, resampling filter, ADPCM coefficients, effect lines */
+            gcn_jaudio_dsp_setup(sJaArgs[0] & 0xFFFF, sJaArgs[1], sJaArgs[2], sJaArgs[3], sJaArgs[4]);
+            break;
+        case 0x82: /* a frame: sub-frames, mixer level, the output's halves */
+            gcn_jaudio_dsp_frame((sJaArgs[0] >> 16) & 0xFF, sJaArgs[0] & 0xFFFF, sJaArgs[1], sJaArgs[2]);
+            break;
+        }
+        ja_mail(0x88880000u | (sJaCommand >> 24)); /* done (never 0x88881357) */
+    }
+}
+#else
+u32 DSPCheckMailFromDSP(void) { return 0; }
+u32 DSPReadMailFromDSP(void) { return 0; }
+#endif
+
 void DSPInit(void) {}
 BOOL DSPCheckInit(void) { return TRUE; }
 u32 DSPCheckMailToDSP(void) { return 0; }
-u32 DSPCheckMailFromDSP(void) { return 0; }
 u32 DSPReadCPUToDSPMbox(void) { return 0; }
-u32 DSPReadMailFromDSP(void) { return 0; }
 void DSPAssertInt(void) {}
 void DSPHalt(void) {}
 void DSPReset(void) {}
@@ -299,6 +403,10 @@ u32 DSPGetDMAStatus(void) { return 0; }
 
 void DSPSendMailToDSP(u32 mail)
 {
+#if GCN_DSP_JAUDIO
+    ja_send(mail);
+    return;
+#endif
     if (!sMailHeader)
     {
         if ((mail >> 16) == 0xBABE) sMailHeader = mail;

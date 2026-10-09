@@ -216,9 +216,47 @@ BOOL DVDReadAsyncPrio(DVDFileInfo *fileInfo, void *addr, s32 length, s32 offset,
     return TRUE;
 }
 
+/* GCN_DVD_SYNC_WAIT (a game's gcn_game.json "defines"): a synchronous read blocks its thread
+ * until the completion is delivered, as the SDK's waits for the drive's interrupt; other threads
+ * run meanwhile (Pikmin's DVD thread loads a sound bank while the main thread finishes setting up
+ * the scene the bank's "loaded" callback checks). Off: the read returns at once. */
+#ifndef GCN_DVD_SYNC_WAIT
+#define GCN_DVD_SYNC_WAIT 0
+#endif
+#if GCN_DVD_SYNC_WAIT
+static OSThreadQueue sSyncQueue;
+static int sSyncQueueReady;
+
+static void sync_done(s32 result, DVDCommandBlock *block)
+{
+    OSWakeupThread(&sSyncQueue);
+}
+#endif
+
 s32 DVDReadPrio(DVDFileInfo *fileInfo, void *addr, s32 length, s32 offset, s32 prio)
 {
     read_now(&fileInfo->cb, addr, length, fileInfo->startAddr + (u32)offset);
+#if GCN_DVD_SYNC_WAIT
+    {
+        BOOL enabled;
+        if (!sSyncQueueReady)
+        {
+            OSInitThreadQueue(&sSyncQueue);
+            sSyncQueueReady = 1;
+        }
+        fileInfo->cb.callback = sync_done;
+        fileInfo->cb.state = DVD_STATE_BUSY;
+        complete_later(&fileInfo->cb);
+        enabled = OSDisableInterrupts();
+        while (fileInfo->cb.state == DVD_STATE_BUSY)
+        {
+            OSSleepThread(&sSyncQueue);
+            /* a callback cannot wait (the sleep returns at once): complete it here */
+            if (fileInfo->cb.state == DVD_STATE_BUSY) gcn_dvd_poll();
+        }
+        OSRestoreInterrupts(enabled);
+    }
+#endif
     fileInfo->cb.state = DVD_STATE_END;
     return (s32)fileInfo->cb.transferredSize;
 }

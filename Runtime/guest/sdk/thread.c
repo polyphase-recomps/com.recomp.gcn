@@ -32,6 +32,21 @@ static int sInEvents;
 
 static void dequeue(OSThread *t);
 
+/* GCN_PREEMPT (a game's gcn_game.json "defines"): a thread an interrupt woke that outranks the
+ * running one runs at once, as the console switches on the interrupt's return (Pikmin's audio
+ * thread, woken by the DSP and AI interrupts, while the main thread spins on its results); and
+ * an interrupt the runtime raised itself (the DSP's end of a sub-frame) is taken before a
+ * blocking thread hands over to another, as the console takes it a moment later wherever the
+ * CPU is (JAudio measures its sub-frames and drops voices when they look as slow as frames).
+ * GCN_LOOP_RETRACE=n: a loop that polls n times with nothing to deliver lets a retrace happen
+ * (time passes while code waits on another thread). Both off by default. */
+#ifndef GCN_PREEMPT
+#define GCN_PREEMPT 0
+#endif
+#ifndef GCN_LOOP_RETRACE
+#define GCN_LOOP_RETRACE 0
+#endif
+
 /* Delivering events (interrupt handlers, callbacks): as the exception, with interrupts off and
  * the interrupted code's state given back afterwards (gcn_os_interrupt_enter / leave). Not
  * nested: sInEvents keeps a second delivery out. */
@@ -154,6 +169,14 @@ static void schedule(int yield)
     if (sSchedulerOff || sInEvents) return;
     for (;;)
     {
+#if GCN_PREEMPT
+        if (gcn_interrupts_raised())
+        {
+            events_begin();
+            gcn_dispatch_interrupts();
+            events_end();
+        }
+#endif
         t = pick(yield);
         if (t)
         {
@@ -162,8 +185,12 @@ static void schedule(int yield)
         }
         /* nothing can run: interrupts the GPU raised may wake someone; else wait */
         events_begin();
+#if GCN_PREEMPT
+        if (gcn_dvd_poll_count() + gcn_dsp_poll() + gcn_dispatch_interrupts())
+#else
         gcn_dvd_poll();
         if (gcn_dsp_poll() + gcn_dispatch_interrupts())
+#endif
         {
             events_end();
             continue;
@@ -248,16 +275,37 @@ void gcn_spin_wait(void)
     n += gcn_dispatch_interrupts();
     if (!n) gcn_vi_retrace();
     events_end();
+#if GCN_PREEMPT
+    gcn_reschedule(); /* a thread that outranks the spinning one runs (it may be what it waits for) */
+#endif
 }
 
 void gcn_interrupt_point(void)
 {
+    int n;
+#if GCN_LOOP_RETRACE
+    static int sQuiet;
+#endif
+
     if (sInEvents || !gcn_os_interrupts_enabled()) return;
     events_begin();
-    gcn_dvd_poll();
-    gcn_dsp_poll();
-    gcn_dispatch_interrupts();
+    n = gcn_dvd_poll_count();
+    n += gcn_dsp_poll();
+    n += gcn_dispatch_interrupts();
+#if GCN_LOOP_RETRACE
+    if (n) sQuiet = 0;
+    else if (++sQuiet >= GCN_LOOP_RETRACE)
+    {
+        sQuiet = 0;
+        gcn_vi_retrace();
+        n = 1;
+    }
+#endif
     events_end();
+#if GCN_PREEMPT
+    if (n) gcn_reschedule();
+#endif
+    (void)n;
 }
 
 /* The idle thread (OSSetIdleFunction: priority 31, the lowest) runs only when every other thread
