@@ -54,7 +54,9 @@ private:
     void ReadPad(int port, GcnPad& pad) const;
     void EnsureDisplayQuad();
     // `scale`: the frame is drawn at scale x the game's resolution (mod settings "Resolution")
-    void UpdateDisplayTexture(const uint8_t* pixels, int width, int height, int scale = 1);
+    // logicalW x logicalH: the picture's size in the console's pixels (0: width / scale)
+    void UpdateDisplayTexture(const uint8_t* pixels, int width, int height, int scale = 1, int logicalW = 0,
+                              int logicalH = 0);
 #if PLATFORM_DOLPHIN
     // Wii / GameCube: the display texture the console's GPU copies the game's frames into.
     void EnsureConsoleDisplay();

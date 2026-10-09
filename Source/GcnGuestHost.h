@@ -55,9 +55,11 @@ void HoldButtons(uint16_t buttons, int frames);
 bool GetRumble(int port);
 
 // Main thread: the newest frame if it changed since lastSerial (RGBA8, width x height), drawn
-// at `scale` x the game's resolution (mod settings "Resolution"). rgba stays valid until the
-// next call (it is read in place).
-bool GetFrame(uint32_t& lastSerial, const uint8_t*& rgba, int& width, int& height, int* scale = nullptr);
+// at `scale` x the game's resolution (mod settings "Resolution"), or upscaled to any size (mod
+// settings "Upscaler"): logicalW x logicalH is its size in the console's pixels, what it is placed
+// by. rgba stays valid until the next call (it is read in place).
+bool GetFrame(uint32_t& lastSerial, const uint8_t*& rgba, int& width, int& height, int* scale = nullptr,
+              int* logicalW = nullptr, int* logicalH = nullptr);
 
 // Main thread: queued audio (interleaved stereo 16-bit, host order) and its rate.
 uint32_t PeekAudio(const int16_t*& frames, uint32_t maxFrames, uint32_t& rate);

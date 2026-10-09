@@ -1,0 +1,18 @@
+#version 450
+// SMAA 1x, pass 1: color edge detection (in0: the picture) into the edges (rg).
+#include "gcn_post.glsl"
+#define SMAA_RT_METRICS pc.rt
+#define SMAA_GLSL_4 1
+#define SMAA_PRESET_HIGH 1
+#include "SMAA.glsl"
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.size.x) || p.y >= int(pc.size.y)) return;
+    vec2 tc = (vec2(p) + 0.5) * pc.rt.xy;
+    vec4 off[3];
+    SMAAEdgeDetectionVS(tc, off);
+    vec2 e = SMAAColorEdgeDetectionPS(tc, off, in0);
+    imageStore(outImg, p, vec4(e, 0.0, 0.0));
+}

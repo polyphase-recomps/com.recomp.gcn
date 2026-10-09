@@ -15,13 +15,15 @@ struct State
     ivec4 reg[4];      // PREV, REG0..2 rgba
     ivec4 fog[2];      // type, ortho, bmag, bshift | r, g, b, -
     vec4 fogf;         // a, c
-    ivec4 smp[8];      // per map: slot, w, h, wrap s | wrap t << 2 | linear << 4
+    ivec4 smp[8];      // per map: slot, w, h, wrap s | wrap t << 2 | linear << 4 | filter << 5
     ivec4 stage[64];   // 4 per stage, see gcn_vk.h
 };
 
 layout(std430, set = 0, binding = 0) readonly buffer States { State st[]; };
 layout(set = 0, binding = 1) uniform texture2D textures[4096];
-layout(set = 0, binding = 2) uniform sampler samplers[18]; // wrap s + wrap t * 3 + linear * 9
+// wrap s + wrap t * 3 + linear * 9; then 18 + (filter - 1) * 9 + wrap s + wrap t * 3: mipmapped linear,
+// filter 1 trilinear, 2..5 anisotropic 2x..16x (the Textures setting, for the world's maps)
+layout(set = 0, binding = 2) uniform sampler samplers[63];
 
 layout(location = 0) noperspective in float v_iw;
 layout(location = 1) noperspective in vec4 v_col0;
@@ -80,11 +82,24 @@ ivec4 sample_map(uint s, int map, vec2 uv)
     if (!(abs(uv.x) < 1e6)) uv.x = 0.0; // also NaN
     if (!(abs(uv.y) < 1e6)) uv.y = 0.0;
     // 0 clamp, 1 repeat, 2 mirror (3, not a mode, repeats as in gcn_raster.c's wrap())
-    int ws = m.w & 3, wt = (m.w >> 2) & 3, lin = (m.w >> 4) & 1;
+    int ws = m.w & 3, wt = (m.w >> 2) & 3, lin = (m.w >> 4) & 1, filt = (m.w >> 5) & 7;
     if (ws == 3) ws = 1;
     if (wt == 3) wt = 1;
-    int si = ws + wt * 3 + lin * 9;
-    vec4 c = textureLod(sampler2D(textures[nonuniformEXT(m.x)], samplers[nonuniformEXT(si)]), uv, 0.0);
+    vec4 c;
+    if (filt != 0)
+    {
+        // mipmapped, trilinear / anisotropic: the level from the coordinates' screen derivatives
+        // (the same for the whole primitive: the stage loop and this branch are per primitive)
+        vec2 dx = dFdx(uv), dy = dFdy(uv);
+        if (!(abs(dx.x) + abs(dx.y) + abs(dy.x) + abs(dy.y) < 1e6)) dx = dy = vec2(0.0);
+        int si = 18 + (filt - 1) * 9 + ws + wt * 3;
+        c = textureGrad(sampler2D(textures[nonuniformEXT(m.x)], samplers[nonuniformEXT(si)]), uv, dx, dy);
+    }
+    else
+    {
+        int si = ws + wt * 3 + lin * 9;
+        c = textureLod(sampler2D(textures[nonuniformEXT(m.x)], samplers[nonuniformEXT(si)]), uv, 0.0);
+    }
     return ivec4(c * 255.0 + 0.5);
 }
 

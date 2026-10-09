@@ -38,6 +38,22 @@ uint32_t gcn_gpu_take_interrupts(void);
 const uint32_t *gcn_gpu_frame(int *width, int *height);
 int gcn_gpu_frame_stride(void);
 int gcn_gpu_frame_scale(void);
+/* The last picture's size in the console's pixels (the rectangle the game copied): the picture is
+ * that times the render resolution, or the output size when upscaled (gcn_gpu_set_post). */
+void gcn_gpu_frame_logical(int *width, int *height);
+/* Display post-processing on the host's GPU (the mod settings Anti-aliasing / Upscaler /
+ * Sharpness): SMAA 1x, FSR 1 upscaling to the output size (gcn_gpu_set_output_size: the
+ * picture's size on screen, in pixels; only to something larger), FSR 1 sharpening 0 off, 1 low,
+ * 2 medium, 3 high. From the game's next picture. Runner: GCN_SMAA=1, GCN_FSR=<w>x<h>,
+ * GCN_SHARPNESS=n. */
+void gcn_gpu_set_post(int smaa, int upscale, int sharpness);
+void gcn_gpu_set_output_size(int width, int height);
+/* 1: the host's GPU draws and can post-process / filter (the settings above and below apply) */
+int gcn_gpu_post_supported(void);
+/* Texture filtering (the mod setting Textures) for the world's textures (mipmapped by the game, or
+ * linear-filtered power-of-two ones of 8x8 or more): 0 the game's own, 1 trilinear, 2..5
+ * anisotropic 2x, 4x, 8x, 16x. Host GPU only. Runner: GCN_TEXTURES=n. */
+void gcn_gpu_set_texture_filter(int level);
 /* Render resolution (software GPU): the game is drawn at scale x the console's 640x528 frame
  * buffer, from its next finished picture on. Copies into textures are filtered back down to
  * the sizes the game asked for; the picture stays large. 1..gcn_gpu_max_render_scale() (1 on

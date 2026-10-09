@@ -50,6 +50,12 @@ static int OnLoad(PolyphaseEngineAPI* api)
     Recomp_SetMaxResolution(gcn_gpu_max_render_scale());
 #endif
 #endif
+#if defined(RECOMP_DISPLAY_HAS_RENDER_FEATURES) && !PLATFORM_DOLPHIN && !PLATFORM_3DS && !PLATFORM_ANDROID
+    // the GPU renderer's post-processing and texture filtering (gcn_vk.c; nothing with the
+    // software rasteriser, which a machine without Vulkan 1.2 falls back to)
+    Recomp_SetRenderFeatures(RecompRender_Upscaler | RecompRender_Sharpness | RecompRender_AntiAlias |
+                             RecompRender_Textures);
+#endif
     if (api && api->LogDebug)
     {
         api->LogDebug("com.recomp.gcn loaded!");

@@ -1,0 +1,18 @@
+#version 450
+// SMAA 1x, pass 3: neighborhood blending (in0: the picture, in1: the weights).
+#include "gcn_post.glsl"
+#define SMAA_RT_METRICS pc.rt
+#define SMAA_GLSL_4 1
+#define SMAA_PRESET_HIGH 1
+#include "SMAA.glsl"
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.size.x) || p.y >= int(pc.size.y)) return;
+    vec2 tc = (vec2(p) + 0.5) * pc.rt.xy;
+    vec4 off;
+    SMAANeighborhoodBlendingVS(tc, off);
+    vec4 c = SMAANeighborhoodBlendingPS(tc, off, in0, in1);
+    imageStore(outImg, p, vec4(c.rgb, 1.0));
+}

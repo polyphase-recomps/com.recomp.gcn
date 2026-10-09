@@ -452,6 +452,9 @@ typedef struct
 {
     const uint32_t *px;
     int w, h, ws, wt, linear;
+    int mip;    /* the Textures setting filters it: mipmapped by the game, or a linear-filtered
+                 * power-of-two texture of 8x8 or more (the world's; not pixel art, nearest
+                 * filtered, nor copies of the frame buffer) */
     int mx, my; /* wrap masks for repeat on power-of-two sizes, -1 = use wrap() */
     float fw, fh;
 } Sampler;
@@ -466,7 +469,7 @@ typedef struct
     TevStage sStage[16];
     Col sReg[4];                    /* PREV, REG0..2 (11-bit signed) */
     TexEntry *sTexMap[8];
-    int sTexWrapS[8], sTexWrapT[8], sTexLinear[8];
+    int sTexWrapS[8], sTexWrapT[8], sTexLinear[8], sTexMip[8], sTexMinLinear[8];
     int sZTest, sZFunc, sZUpd;
     int sBlend, sBlendSub, sBlendSF, sBlendDF, sColorUpd, sAlphaUpd, sPeFmt, sDstAlphaOn, sDstAlpha;
     int sAR0, sAR1, sAF0, sAF1, sAOp;
@@ -486,12 +489,18 @@ static PrimState sCur; /* what setup_state decoded for the primitive being issue
 static void resolve_texture(int map)
 {
     static const uint8_t mode0r[8] = {0x80, 0x81, 0x82, 0x83, 0xA0, 0xA1, 0xA2, 0xA3};
-    uint32_t m0 = BP(mode0r[map]);
+    static const uint8_t mode1r[8] = {0x84, 0x85, 0x86, 0x87, 0xA4, 0xA5, 0xA6, 0xA7};
+    uint32_t m0 = BP(mode0r[map]), m1 = BP(mode1r[map]);
 
     sCur.sTexMap[map] = texture(map);
     sCur.sTexWrapS[map] = BITS(m0, 0, 2);
     sCur.sTexWrapT[map] = BITS(m0, 2, 2);
     sCur.sTexLinear[map] = BITS(m0, 4, 1);
+    /* min filter (bits 5-7) near / linear with mipmaps (1, 2, 5, 6) and a max LOD above 0: the
+     * game's mipmapped textures; 4: linear without (the full-size texture is all that is drawn
+     * otherwise) */
+    sCur.sTexMip[map] = (BITS(m0, 5, 3) & 3) != 0 && BITS(m1, 8, 8) != 0;
+    sCur.sTexMinLinear[map] = BITS(m0, 5, 3) == 4;
 }
 
 /* a + (b - a) * f / 256 on all four 8-bit channels at once, two per 32-bit lane pair */
@@ -541,118 +550,152 @@ static void mul34(uint32_t addr, const float *in, float *out)
     }
 }
 
-/* XF lighting of a color channel, decoded once per primitive (setup_lighting) */
+/* XF lighting, decoded once per primitive (setup_lighting). The 8 lights (XF 0x600-0x67F): color
+ * RGBA, angle attenuation a0-a2, distance attenuation k0-k2, position and direction (view space;
+ * the SDK stores a spot light's direction negated, a specular light's half-angle vector). */
 typedef struct
 {
-    float col[3], pos[3], dir[3], a[3], k[3]; /* color, position, direction, angle and distance attenuation */
+    float col[4], pos[3], dir[3], a[3], k[3];
 } LightInfo;
+
+/* a channel's color or alpha part (XF 0x100E / 0x1010 + channel) */
+typedef struct
+{
+    int mat_vtx, amb_vtx, lit, diffuse, atten, spot;
+    unsigned mask; /* the lights it sums */
+} PartSetup;
 
 typedef struct
 {
-    int mat_vtx, amb_vtx, alpha_vtx, lit, diffuse, atten, spot, nlights;
+    PartSetup p[2]; /* color, alpha */
     float m[4], a[4];
-    LightInfo l[8];
 } ChanSetup;
 
 static ChanSetup sChan[2];
+static LightInfo sLight[8];
+
+static void setup_part(PartSetup *p, uint32_t cc)
+{
+    p->mat_vtx = BITS(cc, 0, 1);
+    p->lit = BITS(cc, 1, 1);
+    p->amb_vtx = BITS(cc, 6, 1);
+    p->diffuse = BITS(cc, 7, 2);
+    p->atten = BITS(cc, 9, 1);
+    p->spot = BITS(cc, 10, 1); /* else specular */
+    p->mask = BITS(cc, 2, 4) | (BITS(cc, 11, 4) << 4);
+}
 
 static void setup_lighting(void)
 {
     int chan, i, k;
 
+    for (i = 0; i < 8; i++)
+    {
+        uint32_t lb = 0x600 + i * 16;
+        LightInfo *l = &sLight[i];
+        for (k = 0; k < 4; k++) l->col[k] = (float)((XF(lb + 3) >> (24 - k * 8)) & 255);
+        for (k = 0; k < 3; k++)
+        {
+            l->a[k] = xff(lb + 4 + k);
+            l->k[k] = xff(lb + 7 + k);
+            l->pos[k] = xff(lb + 10 + k);
+            l->dir[k] = xff(lb + 13 + k);
+        }
+    }
     for (chan = 0; chan < 2; chan++)
     {
         ChanSetup *c = &sChan[chan];
-        uint32_t cc = XF(0x100E + chan), ac = XF(0x1010 + chan);
         uint32_t mat = XF(0x100C + chan), amb = XF(0x100A + chan);
-        uint32_t mask = BITS(cc, 2, 4) | (BITS(cc, 11, 4) << 4);
 
         for (k = 0; k < 4; k++)
         {
             c->m[k] = (float)((mat >> (24 - k * 8)) & 255);
             c->a[k] = (float)((amb >> (24 - k * 8)) & 255);
         }
-        c->mat_vtx = BITS(cc, 0, 1);
-        c->amb_vtx = BITS(cc, 6, 1);
-        c->alpha_vtx = BITS(ac, 0, 1);
-        c->lit = BITS(cc, 1, 1);
-        c->diffuse = BITS(cc, 7, 2);
-        c->atten = BITS(cc, 9, 1);
-        c->spot = BITS(cc, 10, 1); /* else specular: not modelled, treated as spot */
-        c->nlights = 0;
-        if (!c->lit) continue;
-        for (i = 0; i < 8; i++)
-        {
-            uint32_t lb = 0x600 + i * 16;
-            LightInfo *l = &c->l[c->nlights];
-
-            if (!(mask & (1u << i))) continue;
-            for (k = 0; k < 3; k++)
-            {
-                l->col[k] = (float)((XF(lb + 3) >> (24 - k * 8)) & 255);
-                l->a[k] = xff(lb + 4 + k);
-                l->k[k] = xff(lb + 7 + k);
-                l->pos[k] = xff(lb + 10 + k);
-                l->dir[k] = xff(lb + 13 + k);
-            }
-            c->nlights++;
-        }
+        setup_part(&c->p[0], XF(0x100E + chan));
+        setup_part(&c->p[1], XF(0x1010 + chan));
     }
+}
+
+/* a light's weight at a vertex: the diffuse term times the attenuation */
+static float light_weight(const PartSetup *p, const LightInfo *l, const float *wpos, const float *wnrm)
+{
+    float d[3], len, ndl, att = 1.0f;
+
+    d[0] = l->pos[0] - wpos[0];
+    d[1] = l->pos[1] - wpos[1];
+    d[2] = l->pos[2] - wpos[2];
+    len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (len > 0.0f)
+    {
+        float il = 1.0f / len;
+        d[0] *= il;
+        d[1] *= il;
+        d[2] *= il;
+    }
+    ndl = d[0] * wnrm[0] + d[1] * wnrm[1] + d[2] * wnrm[2];
+    if (p->atten)
+    {
+        float cs, aa, dd;
+        if (p->spot)
+        {
+            /* the angle to the spot's axis (its direction is stored negated), the distance */
+            cs = d[0] * l->dir[0] + d[1] * l->dir[1] + d[2] * l->dir[2];
+            if (cs < 0.0f) cs = 0.0f;
+            aa = l->a[0] + l->a[1] * cs + l->a[2] * cs * cs;
+            dd = l->k[0] + l->k[1] * len + l->k[2] * len * len;
+        }
+        else
+        {
+            /* specular: the normal against the half-angle vector, both polynomials in it */
+            cs = ndl >= 0.0f ? wnrm[0] * l->dir[0] + wnrm[1] * l->dir[1] + wnrm[2] * l->dir[2] : 0.0f;
+            if (cs < 0.0f) cs = 0.0f;
+            aa = l->a[0] + l->a[1] * cs + l->a[2] * cs * cs;
+            dd = l->k[0] + l->k[1] * cs + l->k[2] * cs * cs;
+        }
+        att = dd != 0.0f ? (aa < 0.0f ? 0.0f : aa) / dd : 0.0f;
+    }
+    if (p->diffuse == 0) ndl = 1.0f;
+    else if (p->diffuse == 2 && ndl < 0.0f) ndl = 0.0f;
+    return ndl * att;
 }
 
 static void light_channel(int chan, const GcnVertexIn *in, const float *wpos, const float *wnrm, float *out)
 {
     const ChanSetup *c = &sChan[chan];
-    int has = in->has_col[chan], k, i;
+    int has = in->has_col[chan], part, k, i;
     float m[4];
 
     for (k = 0; k < 4; k++) m[k] = c->m[k];
-    if (c->mat_vtx)
+    if (c->p[0].mat_vtx)
         for (k = 0; k < 3; k++) m[k] = has ? in->col[chan][k] * 255.0f : 255.0f;
-    if (c->alpha_vtx) m[3] = has ? in->col[chan][3] * 255.0f : 255.0f;
+    if (c->p[1].mat_vtx) m[3] = has ? in->col[chan][3] * 255.0f : 255.0f;
 
-    if (c->lit)
+    for (part = 0; part < 2; part++)
     {
-        float acc[3];
+        const PartSetup *p = &c->p[part];
+        const int k0 = part ? 3 : 0, k1 = part ? 4 : 3; /* rgb, or a */
+        float acc[4];
 
-        for (k = 0; k < 3; k++) acc[k] = (c->amb_vtx && has) ? in->col[chan][k] * 255.0f : c->a[k];
-        for (i = 0; i < c->nlights; i++)
+        if (!p->lit)
         {
-            const LightInfo *l = &c->l[i];
-            float d[3], len, ndl, att = 1.0f;
-
-            d[0] = l->pos[0] - wpos[0];
-            d[1] = l->pos[1] - wpos[1];
-            d[2] = l->pos[2] - wpos[2];
-            len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-            if (len > 0.0f)
-            {
-                float il = 1.0f / len;
-                d[0] *= il; d[1] *= il; d[2] *= il;
-            }
-            ndl = d[0] * wnrm[0] + d[1] * wnrm[1] + d[2] * wnrm[2];
-            if (c->diffuse == 0) ndl = 1.0f;
-            else if (c->diffuse == 2 && ndl < 0) ndl = 0;
-            if (c->atten)
-            {
-                float cosx = -(d[0] * l->dir[0] + d[1] * l->dir[1] + d[2] * l->dir[2]);
-                float aa = c->spot ? l->a[0] + l->a[1] * cosx + l->a[2] * cosx * cosx : 1.0f;
-                float dd = l->k[0] + l->k[1] * len + l->k[2] * len * len;
-                att = dd != 0.0f ? (aa < 0 ? 0 : aa) / dd : 0.0f;
-            }
-            for (k = 0; k < 3; k++) acc[k] += l->col[k] * ndl * att;
+            for (k = k0; k < k1; k++) out[k] = m[k];
+            continue;
         }
-        for (k = 0; k < 3; k++)
+        for (k = k0; k < k1; k++) acc[k] = (p->amb_vtx && has) ? in->col[chan][k] * 255.0f : c->a[k];
+        for (i = 0; i < 8; i++)
+        {
+            float w;
+            if (!(p->mask & (1u << i))) continue;
+            w = light_weight(p, &sLight[i], wpos, wnrm);
+            for (k = k0; k < k1; k++) acc[k] += sLight[i].col[k] * w;
+        }
+        for (k = k0; k < k1; k++)
         {
             float v = acc[k] < 0 ? 0 : acc[k] > 255 ? 255 : acc[k];
             out[k] = m[k] * v * (1.0f / 255.0f);
         }
     }
-    else
-    {
-        for (k = 0; k < 3; k++) out[k] = m[k];
-    }
-    out[3] = m[3]; /* alpha lighting: material only (lit alpha is rare) */
 }
 
 static void transform(const GcnVertexIn *in, VtxOut *o)
@@ -1042,6 +1085,8 @@ static void setup_pixel_state(void)
         sm->ws = sCur.sTexWrapS[s];
         sm->wt = sCur.sTexWrapT[s];
         sm->linear = sCur.sTexLinear[s];
+        sm->mip = sCur.sTexMip[s] || (sCur.sTexMinLinear[s] && sm->w >= 8 && sm->h >= 8 && (sm->w & (sm->w - 1)) == 0 &&
+                                      (sm->h & (sm->h - 1)) == 0);
         sm->mx = (sm->ws == 1 && (sm->w & (sm->w - 1)) == 0) ? sm->w - 1 : -1;
         sm->my = (sm->wt == 1 && (sm->h & (sm->h - 1)) == 0) ? sm->h - 1 : -1;
     }
@@ -1747,7 +1792,8 @@ static void pack_state(const PrimState *ps, GcnVkState *o)
         o->smp[i][0] = te ? te->slot : -1;
         o->smp[i][1] = ps->smp[i].w;
         o->smp[i][2] = ps->smp[i].h;
-        o->smp[i][3] = ps->smp[i].ws | (ps->smp[i].wt << 2) | (ps->smp[i].linear << 4);
+        o->smp[i][3] = ps->smp[i].ws | (ps->smp[i].wt << 2) | (ps->smp[i].linear << 4) |
+                       ((ps->smp[i].mip ? gcn_vk_texture_filter() : 0) << 5);
     }
     for (i = 0; i < ps->sNumStages && i < 16; i++)
     {
@@ -2091,23 +2137,27 @@ static void hw_xf_state(void)
             x.chan[ch * 2][k] = c->m[k];
             x.chan[ch * 2 + 1][k] = c->a[k];
         }
-        x.chanf[ch * 2] = (uint32_t)(c->mat_vtx | c->amb_vtx << 1 | c->alpha_vtx << 2 | c->lit << 3 | c->diffuse << 4 |
-                                     c->atten << 6 | c->spot << 7);
-        x.chanf[ch * 2 + 1] = (uint32_t)(c->lit ? c->nlights : 0);
-        for (i = 0; c->lit && i < c->nlights; i++)
+        for (k = 0; k < 2; k++)
         {
-            const LightInfo *l = &c->l[i];
-            for (k = 0; k < 3; k++)
-            {
-                x.light[ch][i][0][k] = l->col[k];
-                x.light[ch][i][1][k] = l->pos[k];
-                x.light[ch][i][2][k] = l->dir[k];
-                x.light[ch][i][3][k] = l->k[k];
-            }
-            x.light[ch][i][0][3] = l->a[0];
-            x.light[ch][i][1][3] = l->a[1];
-            x.light[ch][i][2][3] = l->a[2];
+            const PartSetup *p = &c->p[k];
+            x.chanf[ch * 2 + k] = (uint32_t)(p->mat_vtx | p->amb_vtx << 1 | p->lit << 3 | p->diffuse << 4 | p->atten << 6 |
+                                             p->spot << 7) |
+                                  (p->lit ? p->mask << 8 : 0u);
         }
+    }
+    for (i = 0; i < 8; i++)
+    {
+        const LightInfo *l = &sLight[i];
+        for (k = 0; k < 4; k++) x.light[i][0][k] = l->col[k];
+        for (k = 0; k < 3; k++)
+        {
+            x.light[i][1][k] = l->pos[k];
+            x.light[i][2][k] = l->dir[k];
+            x.light[i][3][k] = l->k[k];
+        }
+        x.light[i][1][3] = l->a[0];
+        x.light[i][2][3] = l->a[1];
+        x.light[i][3][3] = l->a[2];
     }
     memcpy(x.mtx, &R.xf[0x000], sizeof(x.mtx));
     memcpy(x.nrm, &R.xf[0x400], sizeof(x.nrm));

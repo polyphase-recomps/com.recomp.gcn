@@ -154,7 +154,11 @@ static GcnGpuStats sStats, sLastStats;
 static int sScale = 1, sEfbW = GCN_EFB_W, sEfbH = GCN_EFB_H;
 static volatile int sScaleWanted = 1;
 static int sDisplayStride = GCN_EFB_W, sDisplayScale = 1;
+static int sDisplayLogicalW = GCN_EFB_W, sDisplayLogicalH = 480; /* the picture in console pixels */
 static size_t sDisplayCap;
+
+/* display post-processing (host GPU, gcn_vk_present), set from any thread */
+static volatile int sPostSmaa, sPostUpscale, sPostSharp, sOutW, sOutH;
 
 /* the host's GPU draws (gcn_vk.c): -1 = not decided (GCN_GPU, else software) */
 static int sHostGpuWanted = -1, sHostGpu;
@@ -171,6 +175,29 @@ int gcn_gpu_max_render_scale(void) { return sHostGpu ? MAX_RENDER_SCALE_HW : MAX
 int gcn_gpu_frame_stride(void) { return sDisplayStride; }
 int gcn_gpu_frame_scale(void) { return sDisplayScale; }
 
+void gcn_gpu_frame_logical(int *width, int *height)
+{
+    *width = sDisplayLogicalW;
+    *height = sDisplayLogicalH;
+}
+
+void gcn_gpu_set_post(int smaa, int upscale, int sharpness)
+{
+    sPostSmaa = smaa != 0;
+    sPostUpscale = upscale != 0;
+    sPostSharp = sharpness < 0 ? 0 : sharpness > 3 ? 3 : sharpness;
+}
+
+void gcn_gpu_set_output_size(int width, int height)
+{
+    sOutW = width > 0 ? width : 0;
+    sOutH = height > 0 ? height : 0;
+}
+
+int gcn_gpu_post_supported(void) { return sHostGpu && gcn_vk_post_supported(); }
+
+void gcn_gpu_set_texture_filter(int level) { gcn_vk_set_texture_filter(level); }
+
 void gcn_gpu_init(uint8_t *guest_mem)
 {
     sMem = guest_mem;
@@ -184,6 +211,19 @@ void gcn_gpu_init(uint8_t *guest_mem)
         sDisplay = (uint32_t *)calloc(GCN_EFB_W * GCN_EFB_H, 4);
         sDisplayCap = (size_t)GCN_EFB_W * GCN_EFB_H;
         if (e) gcn_gpu_set_render_scale(atoi(e));
+        /* the display settings, for the runner (GcnPlayer sets them from the mod settings) */
+        if ((e = getenv("GCN_SMAA")) != NULL) sPostSmaa = atoi(e) != 0;
+        if ((e = getenv("GCN_SHARPNESS")) != NULL) gcn_gpu_set_post(sPostSmaa, sPostUpscale, atoi(e));
+        if ((e = getenv("GCN_FSR")) != NULL)
+        {
+            int w = 0, h = 0;
+            if (sscanf(e, "%dx%d", &w, &h) == 2 && w > 0 && h > 0)
+            {
+                sPostUpscale = 1;
+                gcn_gpu_set_output_size(w, h);
+            }
+        }
+        if ((e = getenv("GCN_TEXTURES")) != NULL) gcn_vk_set_texture_filter(atoi(e));
     }
     {
         /* the host's GPU: GCN_GPU=1 / 0 overrides what the host asked for */
@@ -602,25 +642,40 @@ static void efb_copy(uint32_t cmd)
     if (to_xfb)
     {
         const int s = sScale;
-        int dw, dh;
+        int dw, dh, ow = 0, oh = 0, post = 0, posted = 0;
+        GcnVkPost pp;
 
         if (x0 >= GCN_EFB_W) x0 = GCN_EFB_W - 1;
         if (x0 + w > GCN_EFB_W) w = GCN_EFB_W - x0;
         if (h > GCN_EFB_H) h = GCN_EFB_H;
         dw = w * s;
         dh = h * s;
-        if ((size_t)dw * dh > sDisplayCap)
+        /* post-processing (host GPU): the picture may come out at the output size */
+        pp.smaa = sPostSmaa;
+        pp.upscale = sPostUpscale && sOutW > dw && sOutH > dh;
+        pp.sharpness = sPostSharp;
+        if (sHostGpu && (pp.smaa || pp.upscale || pp.sharpness) && gcn_vk_post_supported())
         {
-            uint32_t *grown = (uint32_t *)realloc(sDisplay, (size_t)dw * dh * 4);
+            post = 1;
+            ow = pp.upscale ? sOutW : dw;
+            oh = pp.upscale ? sOutH : dh;
+            if (ow > 8192) ow = 8192;
+            if (oh > 8192) oh = 8192;
+        }
+        if ((size_t)dw * dh > sDisplayCap || (post && (size_t)ow * oh > sDisplayCap))
+        {
+            const size_t want = post && (size_t)ow * oh > (size_t)dw * dh ? (size_t)ow * oh : (size_t)dw * dh;
+            uint32_t *grown = (uint32_t *)realloc(sDisplay, want * 4);
             if (grown)
             {
                 sDisplay = grown;
-                sDisplayCap = (size_t)dw * dh;
+                sDisplayCap = want;
             }
             else
             {
                 dw = GCN_EFB_W; /* keep the old picture */
                 dh = 0;
+                post = 0;
             }
         }
         /* the picture at the render resolution, rows dw apart. The external frame buffer is
@@ -628,7 +683,12 @@ static void efb_copy(uint32_t cmd)
          * with 0: the host's Quad, which blends by alpha, showed nothing) */
         if (dh > 0)
         {
-            if (sHostGpu)
+            if (post && gcn_vk_present(x0 * s, y0 * s, x0 * s + dw, y0 * s + dh, ow, oh, &pp, sDisplay, 0, &ow, &oh))
+            {
+                /* anti-aliased / upscaled / sharpened on the GPU: ow x oh */
+                posted = 1;
+            }
+            else if (sHostGpu)
             {
                 /* straight from the GPU into the picture (made opaque on the way) */
                 gcn_vk_read_into(x0 * s, y0 * s, x0 * s + dw, y0 * s + dh, sDisplay, dw);
@@ -642,12 +702,21 @@ static void efb_copy(uint32_t cmd)
                     for (x = 0; x < dw; x++) dst[x] = srow[x] | 0xFF000000u;
                 }
             }
+            if (posted)
+            {
+                dw = ow;
+                dh = oh;
+            }
             sDisplayW = dw;
             sDisplayH = dh;
             sDisplayStride = dw;
-            sDisplayScale = s;
+            /* whole console pixels per picture pixel (upscaled: the nearest) */
+            sDisplayScale = posted ? (dw + w / 2) / (w > 0 ? w : 1) : s;
+            if (sDisplayScale < 1) sDisplayScale = 1;
+            sDisplayLogicalW = w;
+            sDisplayLogicalH = h;
             sDisplayCopies++; /* a new picture (GcnGuestHost takes it once) */
-            gcn_overlay_draw_scaled(sDisplay, dw, dw, dh, s); /* mods' on-screen text */
+            gcn_overlay_draw_scaled(sDisplay, dw, dw, dh, sDisplayScale); /* mods' on-screen text */
         }
         sLastStats = sStats;
         memset(&sStats, 0, sizeof(sStats));

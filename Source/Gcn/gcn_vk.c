@@ -8,6 +8,13 @@
  * texture uploads go to host-visible buffers that only start over after such a wait; texture
  * slots and pipelines stay. New texture descriptors are written while earlier batches run
  * (descriptorBindingUpdateUnusedWhilePending); without that feature every batch is waited for.
+ *
+ * Textures get mipmaps (blitted down from the full-size texture after the upload) for the
+ * Textures setting: the world's maps (mipmapped by the game, or linear-filtered power-of-two
+ * ones, gcn_raster.c) are sampled trilinear or anisotropic then, the rest (nearest-filtered,
+ * copies of the frame buffer) as before. The picture the game copies to the display can go through post-processing compute
+ * passes (gcn_vk_present): SMAA 1x, FSR 1 EASU to the size it has on screen, FSR 1 RCAS
+ * (Runtime/tools/gpu/gcn_post_*.comp and third_party/: MIT).
  */
 #include "gcn_vk.h"
 
@@ -67,6 +74,16 @@ void gcn_vk_read_into(int x0, int y0, int x1, int y1, uint32_t *dst, int dst_str
 {
     (void)x0; (void)y0; (void)x1; (void)y1; (void)dst; (void)dst_stride;
 }
+int gcn_vk_post_supported(void) { return 0; }
+int gcn_vk_present(int x0, int y0, int x1, int y1, int out_w, int out_h, const GcnVkPost *post, uint32_t *dst,
+                   int dst_stride, int *w, int *h)
+{
+    (void)x0; (void)y0; (void)x1; (void)y1; (void)out_w; (void)out_h; (void)post; (void)dst; (void)dst_stride;
+    (void)w; (void)h;
+    return 0;
+}
+void gcn_vk_set_texture_filter(int level) { (void)level; }
+int gcn_vk_texture_filter(void) { return 0; }
 double gcn_vk_take_gpu_ms(uint32_t *batches) { if (batches) *batches = 0; return 0.0; }
 void gcn_vk_print_stats(int frames) { (void)frames; }
 
@@ -76,6 +93,7 @@ void gcn_vk_print_stats(int frames) { (void)frames; }
 #include <vulkan/vulkan.h>
 
 #include "gcn_vk_spv.h"
+#include "gcn_vk_post_tex.h" /* SMAA's lookup textures */
 #include "gcn_gpu.h" /* GCN_EFB_W / H: the console's frame buffer, the size of shrunk reads */
 
 #ifdef _WIN32
@@ -105,7 +123,8 @@ void gcn_vk_print_stats(int frames) { (void)frames; }
     X(vkCmdSetBlendConstants) X(vkCmdDraw) X(vkCmdClearAttachments) X(vkCmdPipelineBarrier)                           \
     X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) X(vkCmdClearColorImage)                     \
     X(vkCmdClearDepthStencilImage) X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp)          \
-    X(vkGetQueryPoolResults) X(vkCreateSampler)
+    X(vkGetQueryPoolResults) X(vkCreateSampler) X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCmdPushConstants)  \
+    X(vkCmdCopyImage)
 
 #define DECLARE(f) static PFN_##f f;
 static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr_;
@@ -138,7 +157,7 @@ typedef struct
     VkImage image;
     VkDeviceMemory mem;
     VkImageView view;
-    int w, h;
+    int w, h, levels;
 } Image;
 
 typedef struct
@@ -207,7 +226,14 @@ static VkPipelineLayout sPipeLayout;
 static VkDescriptorPool sDescPool;
 static VkDescriptorSet sSet;
 static VkShaderModule sVert, sFrag, sVertXf;
-static VkSampler sSamplers[18]; /* wrap s (clamp, repeat, mirror) + wrap t * 3 + linear * 9 */
+/* wrap s (clamp, repeat, mirror) + wrap t * 3 + linear * 9; then the mipmapped linear ones for the
+ * Textures setting: 18 + (filter - 1) * 9 + wrap s + wrap t * 3, filter 1 trilinear, 2..5
+ * anisotropic 2x..16x (gcn_vk.frag) */
+#define NSAMPLERS 63
+static VkSampler sSamplers[NSAMPLERS];
+static float sMaxAniso = 1.0f; /* 1: no anisotropic filtering */
+static int sMipOK;             /* RGBA8 blits (mipmaps are made on the GPU) */
+static volatile int sTexFilter;
 static struct
 {
     uint32_t key;
@@ -352,7 +378,8 @@ static void free_buffer(Buffer *b)
     memset(b, 0, sizeof(*b));
 }
 
-static int make_image(Image *im, int w, int h, VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect)
+static int make_image_levels(Image *im, int w, int h, VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                             int levels)
 {
     VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -365,7 +392,7 @@ static int make_image(Image *im, int w, int h, VkFormat fmt, VkImageUsageFlags u
     ii.extent.width = (uint32_t)w;
     ii.extent.height = (uint32_t)h;
     ii.extent.depth = 1;
-    ii.mipLevels = 1;
+    ii.mipLevels = (uint32_t)levels;
     ii.arrayLayers = 1;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -384,12 +411,30 @@ static int make_image(Image *im, int w, int h, VkFormat fmt, VkImageUsageFlags u
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = fmt;
     vi.subresourceRange.aspectMask = aspect;
-    vi.subresourceRange.levelCount = 1;
+    vi.subresourceRange.levelCount = (uint32_t)levels;
     vi.subresourceRange.layerCount = 1;
     CHECK(vkCreateImageView(sDev, &vi, NULL, &im->view), "vkCreateImageView");
     im->w = w;
     im->h = h;
+    im->levels = levels;
     return 1;
+}
+
+static int make_image(Image *im, int w, int h, VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect)
+{
+    return make_image_levels(im, w, h, fmt, usage, aspect, 1);
+}
+
+/* levels down to 1x1 */
+static int mip_count(int w, int h)
+{
+    int n = 1, m = w > h ? w : h;
+    while (m > 1)
+    {
+        m >>= 1;
+        n++;
+    }
+    return n;
 }
 
 static void free_image(Image *im)
@@ -400,7 +445,8 @@ static void free_image(Image *im)
     memset(im, 0, sizeof(*im));
 }
 
-static void barrier(VkImage image, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to)
+static void barrier_levels(VkImage image, VkImageAspectFlags aspect, uint32_t base, uint32_t count, VkImageLayout from,
+                           VkImageLayout to)
 {
     VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
@@ -411,10 +457,51 @@ static void barrier(VkImage image, VkImageAspectFlags aspect, VkImageLayout from
     b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = image;
     b.subresourceRange.aspectMask = aspect;
-    b.subresourceRange.levelCount = 1;
+    b.subresourceRange.baseMipLevel = base;
+    b.subresourceRange.levelCount = count;
     b.subresourceRange.layerCount = 1;
     vkCmdPipelineBarrier(sCmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1,
                          &b);
+}
+
+/* every level of the image */
+static void barrier(VkImage image, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to)
+{
+    barrier_levels(image, aspect, 0, VK_REMAINING_MIP_LEVELS, from, to);
+}
+
+/* an uploaded texture's mipmaps (level 0 in TRANSFER_DST, the rest UNDEFINED / TRANSFER_DST), each
+ * level the one above halved (linear); every level SHADER_READ_ONLY after */
+static void gen_mips(const Image *im)
+{
+    int l, w = im->w, h = im->h;
+    for (l = 1; l < im->levels; l++)
+    {
+        VkImageBlit b;
+        const int nw = w > 1 ? w / 2 : 1, nh = h > 1 ? h / 2 : 1;
+        memset(&b, 0, sizeof(b));
+        b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.srcSubresource.mipLevel = (uint32_t)(l - 1);
+        b.srcSubresource.layerCount = 1;
+        b.srcOffsets[1].x = w;
+        b.srcOffsets[1].y = h;
+        b.srcOffsets[1].z = 1;
+        b.dstSubresource = b.srcSubresource;
+        b.dstSubresource.mipLevel = (uint32_t)l;
+        b.dstOffsets[1].x = nw;
+        b.dstOffsets[1].y = nh;
+        b.dstOffsets[1].z = 1;
+        barrier_levels(im->image, VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)(l - 1), 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vkCmdBlitImage(sCmd, im->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, im->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                       &b, VK_FILTER_LINEAR);
+        w = nw;
+        h = nh;
+    }
+    barrier_levels(im->image, VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)(im->levels - 1), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    barrier_levels(im->image, VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)(im->levels - 1), 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
 static int wait_slot(int i)
@@ -823,6 +910,9 @@ static int make_device(void)
     want2.pNext = &want12;
     sDepthClamp = f2.features.depthClamp != 0;
     want2.features.depthClamp = f2.features.depthClamp;
+    /* the Textures setting: anisotropic filtering when the GPU has it (else trilinear at most) */
+    want2.features.samplerAnisotropy = f2.features.samplerAnisotropy;
+    sMaxAniso = f2.features.samplerAnisotropy ? props.limits.maxSamplerAnisotropy : 1.0f;
     dci.pNext = &want2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qi;
@@ -834,6 +924,11 @@ static int make_device(void)
         vkGetPhysicalDeviceFormatProperties(sPhys, VK_FORMAT_D32_SFLOAT, &fp);
         sDepthBlit = (fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT)) ==
                      (VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT);
+        vkGetPhysicalDeviceFormatProperties(sPhys, VK_FORMAT_R8G8B8A8_UNORM, &fp);
+        sMipOK = (fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                              VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) ==
+                 (VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                  VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
     }
     snprintf(sStatus, sizeof(sStatus), "%s", props.deviceName);
     return 1;
@@ -856,7 +951,7 @@ static int make_objects(void)
     VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3},
                                      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_SLOTS},
-                                     {VK_DESCRIPTOR_TYPE_SAMPLER, 18}};
+                                     {VK_DESCRIPTOR_TYPE_SAMPLER, NSAMPLERS}};
     VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     VkShaderModuleCreateInfo smi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -911,17 +1006,26 @@ static int make_objects(void)
     rpi.pSubpasses = &sub;
     CHECK(vkCreateRenderPass(sDev, &rpi, NULL, &sPass), "vkCreateRenderPass");
 
-    for (i = 0; i < 18; i++)
+    for (i = 0; i < NSAMPLERS; i++)
     {
         static const VkSamplerAddressMode kWrap[3] = {VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_REPEAT,
                                                       VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT};
         VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-        sci.magFilter = sci.minFilter = (i / 9) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        sci.addressModeU = kWrap[i % 3];
-        sci.addressModeV = kWrap[(i / 3) % 3];
+        /* the game's own: level 0 only; the Textures setting's: every level, trilinear, anisotropic */
+        const int wrap = i < 18 ? i % 9 : (i - 18) % 9, filter = i < 18 ? 0 : 1 + (i - 18) / 9;
+        const int linear = i < 18 ? i / 9 : 1;
+        sci.magFilter = sci.minFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        sci.mipmapMode = filter ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = kWrap[wrap % 3];
+        sci.addressModeV = kWrap[wrap / 3];
         sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        sci.maxLod = 0.0f;
+        sci.maxLod = filter ? VK_LOD_CLAMP_NONE : 0.0f;
+        if (filter >= 2 && sMaxAniso > 1.0f)
+        {
+            const float want = (float)(1 << (filter - 1));
+            sci.anisotropyEnable = VK_TRUE;
+            sci.maxAnisotropy = want < sMaxAniso ? want : sMaxAniso;
+        }
         CHECK(vkCreateSampler(sDev, &sci, NULL, &sSamplers[i]), "vkCreateSampler");
     }
     memset(binds, 0, sizeof(binds));
@@ -935,7 +1039,7 @@ static int make_objects(void)
     binds[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     binds[2].binding = 2;
     binds[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    binds[2].descriptorCount = 18;
+    binds[2].descriptorCount = NSAMPLERS;
     binds[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     binds[2].pImmutableSamplers = sSamplers;
     for (i = 3; i < 5; i++)
@@ -1092,8 +1196,11 @@ int gcn_vk_texture(const uint32_t *px, int w, int h)
     if (sFreeCount == 0) flush_batch(0, 0, 0, 0, NULL, NULL, 0); /* frees released slots */
     if (sFreeCount == 0) return -1;
     slot = sFree[--sFreeCount];
-    if (!make_image(&sTex[slot], w, h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                    VK_IMAGE_ASPECT_COLOR_BIT))
+    /* with mipmaps (made after the upload) for the Textures setting; the game's own sampling
+     * reads level 0 only */
+    if (!make_image_levels(&sTex[slot], w, h, VK_FORMAT_R8G8B8A8_UNORM,
+                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                           VK_IMAGE_ASPECT_COLOR_BIT, sMipOK ? mip_count(w, h) : 1))
     {
         sFree[sFreeCount++] = slot;
         return -1;
@@ -1292,8 +1399,11 @@ static void kick(int wait, const Read *rd)
         c.imageExtent.depth = 1;
         barrier(sTex[u->slot].image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         vkCmdCopyBufferToImage(sCmd, sStage.buf, sTex[u->slot].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
-        barrier(sTex[u->slot].image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (sTex[u->slot].levels > 1)
+            gen_mips(&sTex[u->slot]);
+        else
+            barrier(sTex[u->slot].image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     if (sOpCount)
     {
@@ -1655,6 +1765,333 @@ double gcn_vk_take_gpu_ms(uint32_t *batches)
     sGpuMs = 0;
     sBatches = 0;
     return ms;
+}
+
+/* ---- texture filtering (the Textures setting) ------------------------------------------------ */
+void gcn_vk_set_texture_filter(int level) { sTexFilter = level < 0 ? 0 : level > 5 ? 5 : level; }
+
+int gcn_vk_texture_filter(void)
+{
+    int l = sTexFilter;
+    if (!sActive || !sMipOK) return 0;
+    if (l > 1 && sMaxAniso <= 1.0f) l = 1; /* no anisotropic filtering here: trilinear */
+    return l;
+}
+
+/* ---- display post-processing (gcn_vk_present) ------------------------------------------------ */
+enum
+{
+    PP_EDGE,   /* SMAA edges */
+    PP_WEIGHT, /* SMAA blending weights */
+    PP_BLEND,  /* SMAA neighborhood blending */
+    PP_EASU,   /* FSR 1 upscaling */
+    PP_RCAS,   /* FSR 1 sharpening */
+    PP_COUNT
+};
+
+typedef struct
+{
+    float rt[4];       /* 1 / w, 1 / h, w, h of the input */
+    uint32_t size[4];  /* input w, h, output w, h */
+    float param[4];    /* x: RCAS sharpness (stops) */
+} PostPush;
+
+static int sPostState; /* 0 not tried, 1 ready, -1 failed */
+static VkDescriptorSetLayout sPostSetLayout;
+static VkPipelineLayout sPostLayout;
+static VkPipeline sPostPipes[PP_COUNT];
+static VkDescriptorPool sPostPool;
+static VkDescriptorSet sPostSets[PP_COUNT];
+static VkSampler sPostLinear;
+static Image sPostSrc, sPostEdges, sPostWeights, sPostAA, sPostUp, sPostSharp, sPostArea, sPostSearch;
+static Buffer sPostRead;
+
+int gcn_vk_post_supported(void) { return sActive && sPostState >= 0; }
+
+static int post_pipeline(int pass, const uint32_t *code, size_t bytes)
+{
+    VkShaderModuleCreateInfo smi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    VkComputePipelineCreateInfo cpi = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    VkShaderModule mod;
+    smi.codeSize = bytes;
+    smi.pCode = code;
+    CHECK(vkCreateShaderModule(sDev, &smi, NULL, &mod), "vkCreateShaderModule (post)");
+    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = mod;
+    cpi.stage.pName = "main";
+    cpi.layout = sPostLayout;
+    CHECK(vkCreateComputePipelines(sDev, VK_NULL_HANDLE, 1, &cpi, NULL, &sPostPipes[pass]), "vkCreateComputePipelines");
+    return 1;
+}
+
+/* a texture of SMAA's (R8G8 / R8), uploaded and left SHADER_READ_ONLY */
+static int post_lut(Image *im, int w, int h, VkFormat fmt, const uint8_t *data, size_t bytes, Buffer *tmp, VkDeviceSize at)
+{
+    VkBufferImageCopy c;
+    if (!make_image(im, w, h, fmt, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
+        return 0;
+    memcpy(tmp->map + at, data, bytes);
+    memset(&c, 0, sizeof(c));
+    c.bufferOffset = at;
+    c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    c.imageSubresource.layerCount = 1;
+    c.imageExtent.width = (uint32_t)w;
+    c.imageExtent.height = (uint32_t)h;
+    c.imageExtent.depth = 1;
+    barrier(im->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vkCmdCopyBufferToImage(sCmd, tmp->buf, im->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    barrier(im->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    return 1;
+}
+
+/* the passes' layout, pipelines, sampler, descriptor sets and SMAA's textures (once) */
+static int post_init(void)
+{
+    VkDescriptorSetLayoutBinding b[4];
+    VkDescriptorSetLayoutCreateInfo dli = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkPushConstantRange pr;
+    VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * PP_COUNT},
+                                     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, PP_COUNT}};
+    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    VkDescriptorSetLayout layouts[PP_COUNT];
+    const size_t areaBytes = sizeof(gcn_smaa_area), searchBytes = sizeof(gcn_smaa_search);
+    Buffer tmp;
+    int i;
+
+    if (sPostState) return sPostState > 0;
+    sPostState = -1;
+    memset(b, 0, sizeof(b));
+    for (i = 0; i < 4; i++)
+    {
+        b[i].binding = (uint32_t)i;
+        b[i].descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        b[i].descriptorCount = 1;
+        b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    dli.bindingCount = 4;
+    dli.pBindings = b;
+    CHECK(vkCreateDescriptorSetLayout(sDev, &dli, NULL, &sPostSetLayout), "vkCreateDescriptorSetLayout (post)");
+    pr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pr.offset = 0;
+    pr.size = sizeof(PostPush);
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &sPostSetLayout;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pr;
+    CHECK(vkCreatePipelineLayout(sDev, &pli, NULL, &sPostLayout), "vkCreatePipelineLayout (post)");
+    sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    CHECK(vkCreateSampler(sDev, &sci, NULL, &sPostLinear), "vkCreateSampler (post)");
+    if (!post_pipeline(PP_EDGE, gcn_post_smaa_edge_spv, sizeof(gcn_post_smaa_edge_spv)) ||
+        !post_pipeline(PP_WEIGHT, gcn_post_smaa_weight_spv, sizeof(gcn_post_smaa_weight_spv)) ||
+        !post_pipeline(PP_BLEND, gcn_post_smaa_blend_spv, sizeof(gcn_post_smaa_blend_spv)) ||
+        !post_pipeline(PP_EASU, gcn_post_easu_spv, sizeof(gcn_post_easu_spv)) ||
+        !post_pipeline(PP_RCAS, gcn_post_rcas_spv, sizeof(gcn_post_rcas_spv)))
+        return 0;
+    dpi.maxSets = PP_COUNT;
+    dpi.poolSizeCount = 2;
+    dpi.pPoolSizes = sizes;
+    CHECK(vkCreateDescriptorPool(sDev, &dpi, NULL, &sPostPool), "vkCreateDescriptorPool (post)");
+    for (i = 0; i < PP_COUNT; i++) layouts[i] = sPostSetLayout;
+    dai.descriptorPool = sPostPool;
+    dai.descriptorSetCount = PP_COUNT;
+    dai.pSetLayouts = layouts;
+    CHECK(vkAllocateDescriptorSets(sDev, &dai, sPostSets), "vkAllocateDescriptorSets (post)");
+
+    memset(&tmp, 0, sizeof(tmp));
+    if (!make_buffer(&tmp, areaBytes + searchBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0)) return 0;
+    if (!begin_cmd()) return 0;
+    if (!post_lut(&sPostArea, GCN_SMAA_AREA_W, GCN_SMAA_AREA_H, VK_FORMAT_R8G8_UNORM, gcn_smaa_area, areaBytes, &tmp, 0) ||
+        !post_lut(&sPostSearch, GCN_SMAA_SEARCH_W, GCN_SMAA_SEARCH_H, VK_FORMAT_R8_UNORM, gcn_smaa_search, searchBytes, &tmp,
+                  areaBytes))
+        return 0;
+    if (!submit(1)) return 0;
+    free_buffer(&tmp);
+    sPostState = 1;
+    fprintf(stderr, "gcn vk: display post-processing ready (SMAA 1x, FSR 1)\n");
+    return 1;
+}
+
+/* an intermediate picture (RGBA8, storage + sampled), recreated at a new size */
+static int post_image(Image *im, int w, int h)
+{
+    if (im->image && im->w == w && im->h == h) return 1;
+    if (im->image) free_image(im);
+    return make_image(im, w, h, VK_FORMAT_R8G8B8A8_UNORM,
+                      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                          VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                      VK_IMAGE_ASPECT_COLOR_BIT);
+}
+
+/* a pass's inputs (sampled, linear, clamped; GENERAL unless SMAA's textures) and output */
+static void post_set(int pass, const Image *in0, const Image *in1, const Image *in2, const Image *out)
+{
+    VkDescriptorImageInfo ii[4];
+    VkWriteDescriptorSet wr[4];
+    const Image *in[3];
+    int i;
+    in[0] = in0;
+    in[1] = in1 ? in1 : in0;
+    in[2] = in2 ? in2 : in0;
+    for (i = 0; i < 4; i++)
+    {
+        const Image *im = i < 3 ? in[i] : out;
+        ii[i].sampler = i < 3 ? sPostLinear : VK_NULL_HANDLE;
+        ii[i].imageView = im->view;
+        ii[i].imageLayout = (im == &sPostArea || im == &sPostSearch) ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                                      : VK_IMAGE_LAYOUT_GENERAL;
+        memset(&wr[i], 0, sizeof(wr[i]));
+        wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[i].dstSet = sPostSets[pass];
+        wr[i].dstBinding = (uint32_t)i;
+        wr[i].descriptorCount = 1;
+        wr[i].descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        wr[i].pImageInfo = &ii[i];
+    }
+    vkUpdateDescriptorSets(sDev, 4, wr, 0, NULL);
+}
+
+/* records one pass: in_w x in_h in, out_w x out_h out (its image GENERAL, written whole) */
+static void post_pass(int pass, int in_w, int in_h, int out_w, int out_h, float param, const Image *out)
+{
+    PostPush pp;
+    memset(&pp, 0, sizeof(pp));
+    pp.rt[0] = 1.0f / (float)in_w;
+    pp.rt[1] = 1.0f / (float)in_h;
+    pp.rt[2] = (float)in_w;
+    pp.rt[3] = (float)in_h;
+    pp.size[0] = (uint32_t)in_w;
+    pp.size[1] = (uint32_t)in_h;
+    pp.size[2] = (uint32_t)out_w;
+    pp.size[3] = (uint32_t)out_h;
+    pp.param[0] = param;
+    barrier(out->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    vkCmdBindPipeline(sCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sPostPipes[pass]);
+    vkCmdBindDescriptorSets(sCmd, VK_PIPELINE_BIND_POINT_COMPUTE, sPostLayout, 0, 1, &sPostSets[pass], 0, NULL);
+    vkCmdPushConstants(sCmd, sPostLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pp), &pp);
+    vkCmdDispatch(sCmd, (uint32_t)(out_w + 7) / 8, (uint32_t)(out_h + 7) / 8, 1);
+    /* the writes, visible to the next pass and the copy out */
+    barrier(out->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+}
+
+int gcn_vk_present(int x0, int y0, int x1, int y1, int out_w, int out_h, const GcnVkPost *post, uint32_t *dst,
+                   int dst_stride, int *w_out, int *h_out)
+{
+    /* RCAS sharpness in stops (0 is the most): Low, Medium, High */
+    static const float kStops[4] = {0.0f, 1.0f, 0.5f, 0.1f};
+    int w, h, cw, ch, up, sharp, y, x;
+    const Image *cur;
+    VkImageCopy ic;
+    VkBufferImageCopy bc;
+
+    if (!sActive || !post || sPostState < 0) return 0;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > sEfbW) x1 = sEfbW;
+    if (y1 > sEfbH) y1 = sEfbH;
+    w = x1 - x0;
+    h = y1 - y0;
+    if (w <= 0 || h <= 0) return 0;
+    if (out_w > 8192) out_w = 8192;
+    if (out_h > 8192) out_h = 8192;
+    /* upscaled only to a larger picture (both ways) */
+    up = post->upscale && out_w >= w && out_h >= h && (out_w > w || out_h > h);
+    sharp = post->sharpness < 0 ? 0 : post->sharpness > 3 ? 3 : post->sharpness;
+    if (!post->smaa && !up && !sharp) return 0;
+    gcn_vk_sync(); /* what the game drew, in order before the passes */
+    if (!post_init()) return 0;
+    cw = up ? out_w : w;
+    ch = up ? out_h : h;
+    if (!post_image(&sPostSrc, w, h)) return 0;
+    if (post->smaa && (!post_image(&sPostEdges, w, h) || !post_image(&sPostWeights, w, h) || !post_image(&sPostAA, w, h)))
+        return 0;
+    if (up && !post_image(&sPostUp, cw, ch)) return 0;
+    if (sharp && !post_image(&sPostSharp, cw, ch)) return 0;
+    if (sPostRead.size < (VkDeviceSize)cw * ch * 4)
+    {
+        free_buffer(&sPostRead);
+        if (!make_buffer(&sPostRead, (VkDeviceSize)cw * ch * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) return 0;
+    }
+
+    /* the passes' inputs and outputs: picture -> [SMAA] -> [EASU] -> [RCAS] */
+    cur = &sPostSrc;
+    if (post->smaa)
+    {
+        post_set(PP_EDGE, &sPostSrc, NULL, NULL, &sPostEdges);
+        post_set(PP_WEIGHT, &sPostEdges, &sPostArea, &sPostSearch, &sPostWeights);
+        post_set(PP_BLEND, &sPostSrc, &sPostWeights, NULL, &sPostAA);
+        cur = &sPostAA;
+    }
+    if (up)
+    {
+        post_set(PP_EASU, cur, NULL, NULL, &sPostUp);
+        cur = &sPostUp;
+    }
+    if (sharp) post_set(PP_RCAS, cur, NULL, NULL, &sPostSharp);
+
+    if (!begin_cmd()) return 0;
+    /* the frame buffer's rectangle into the first picture */
+    memset(&ic, 0, sizeof(ic));
+    ic.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ic.srcSubresource.layerCount = 1;
+    ic.srcOffset.x = x0;
+    ic.srcOffset.y = y0;
+    ic.dstSubresource = ic.srcSubresource;
+    ic.extent.width = (uint32_t)w;
+    ic.extent.height = (uint32_t)h;
+    ic.extent.depth = 1;
+    barrier(sColor.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    barrier(sPostSrc.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vkCmdCopyImage(sCmd, sColor.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sPostSrc.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   1, &ic);
+    barrier(sColor.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    barrier(sPostSrc.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    cur = &sPostSrc;
+    if (post->smaa)
+    {
+        post_pass(PP_EDGE, w, h, w, h, 0.0f, &sPostEdges);
+        post_pass(PP_WEIGHT, w, h, w, h, 0.0f, &sPostWeights);
+        post_pass(PP_BLEND, w, h, w, h, 0.0f, &sPostAA);
+        cur = &sPostAA;
+    }
+    if (up)
+    {
+        post_pass(PP_EASU, w, h, cw, ch, 0.0f, &sPostUp);
+        cur = &sPostUp;
+    }
+    if (sharp)
+    {
+        post_pass(PP_RCAS, cw, ch, cw, ch, kStops[sharp], &sPostSharp);
+        cur = &sPostSharp;
+    }
+    /* out to the host */
+    memset(&bc, 0, sizeof(bc));
+    bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bc.imageSubresource.layerCount = 1;
+    bc.imageExtent.width = (uint32_t)cw;
+    bc.imageExtent.height = (uint32_t)ch;
+    bc.imageExtent.depth = 1;
+    barrier(cur->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    vkCmdCopyImageToBuffer(sCmd, cur->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sPostRead.buf, 1, &bc);
+    if (!submit(1)) return 0;
+
+    if (dst_stride <= 0) dst_stride = cw;
+    for (y = 0; y < ch; y++)
+    {
+        const uint32_t *src = (const uint32_t *)(sPostRead.map + (size_t)y * cw * 4);
+        uint32_t *row = dst + (size_t)y * dst_stride;
+        for (x = 0; x < cw; x++) row[x] = src[x] | 0xFF000000u; /* opaque, as the display copy */
+    }
+    sSt.reads++;
+    sSt.read_bytes += (uint64_t)cw * ch * 4;
+    if (w_out) *w_out = cw;
+    if (h_out) *h_out = ch;
+    return 1;
 }
 
 #endif /* GCN_VK */

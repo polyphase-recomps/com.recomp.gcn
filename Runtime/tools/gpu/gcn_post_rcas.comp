@@ -1,0 +1,21 @@
+#version 450
+// FSR 1 RCAS: contrast-adaptive sharpening of the picture (in0, size.zw), param.x stops.
+#include "gcn_post.glsl"
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 p) { return texelFetch(in0, ivec2(p), 0); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#include "ffx_fsr1.h"
+
+void main()
+{
+    AU2 p = AU2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.size.z || p.y >= pc.size.w) return;
+    AU4 con;
+    FsrRcasCon(con, pc.param.x);
+    AF1 r, g, b;
+    FsrRcasF(r, g, b, p, con);
+    imageStore(outImg, ivec2(p), vec4(r, g, b, 1.0));
+}

@@ -79,9 +79,10 @@ typedef struct GcnVkXf
     float proj[8];         /* XF 0x1020-0x1025 */
     float vp[8];           /* viewport sx, sy, sz, ox, oy, oz, 2 * scale / frame buffer width, 2 * scale / height */
     float chan[4][4];      /* channel 0 material, ambient; channel 1 material, ambient (0..255) */
-    uint32_t chanf[4];     /* channel 0 flags (material from vertex | ambient from vertex << 1 | alpha from
-                              vertex << 2 | lit << 3 | diffuse << 4 | attenuation << 6 | spot << 7), lights; channel 1 */
-    float light[2][8][4][4]; /* per channel, per enabled light: (color, a0), (position, a1), (direction, a2), (k0-k2, -) */
+    uint32_t chanf[4];     /* channel 0 color, channel 0 alpha, channel 1 color, channel 1 alpha: material from
+                              vertex | ambient from vertex << 1 | lit << 3 | diffuse << 4 | attenuation << 6 |
+                              spot << 7 (else specular) | light mask << 8 */
+    float light[8][4][4];  /* the 8 lights: color RGBA, (position, a0), (direction, a1), (k0-k2, a2) */
     float mtx[0x110];      /* XF memory 0x000-0x10F: position and texture matrices */
     float nrm[0x68];       /* 0x400-0x467: normal matrices */
     float pmx[0x110];      /* 0x500-0x60F: post matrices */
@@ -141,6 +142,29 @@ void gcn_vk_read(int x0, int y0, int x1, int y1, uint32_t *color, uint32_t *dept
 void gcn_vk_read_shrunk(int x0, int y0, int x1, int y1, int shrink, uint32_t *color, uint32_t *depth, int stride);
 /* The color of the rectangle into dst, its top left at dst[0], opaque (the display copy). */
 void gcn_vk_read_into(int x0, int y0, int x1, int y1, uint32_t *dst, int dst_stride);
+
+/* Display post-processing (the mod settings Anti-aliasing / Upscaler / Sharpness), on the picture
+ * the game copies to the display: SMAA 1x, then FSR 1 EASU up to out_w x out_h (only when that is
+ * larger), then FSR 1 RCAS. */
+typedef struct GcnVkPost
+{
+    int smaa;      /* 1: SMAA 1x */
+    int upscale;   /* 1: FSR 1 EASU to the output size */
+    int sharpness; /* 0 off, 1 low, 2 medium, 3 high (RCAS) */
+} GcnVkPost;
+/* 1: the GPU can (compute shaders, storage images) */
+int gcn_vk_post_supported(void);
+/* gcn_vk_read_into through the post-processing: the rectangle's picture, out_w x out_h when it is
+ * upscaled (else its own size), into dst (rows dst_stride pixels apart, room for the larger),
+ * opaque. *w / *h: the size written. 0: not done (the caller reads it plainly). */
+int gcn_vk_present(int x0, int y0, int x1, int y1, int out_w, int out_h, const GcnVkPost *post, uint32_t *dst,
+                   int dst_stride, int *w, int *h);
+
+/* Texture filtering (the mod setting Textures) for the world's maps (mipmapped by the game, or
+ * linear-filtered power-of-two ones of 8x8 or more): 0 the game's own (the full-size texture only), 1 trilinear, 2..5 anisotropic 2x, 4x, 8x, 16x (clamped to what the
+ * GPU can; mipmaps are made from the full-size texture). Takes effect for new primitives. */
+void gcn_vk_set_texture_filter(int level);
+int gcn_vk_texture_filter(void);
 /* Draws everything recorded so far (waits). */
 void gcn_vk_sync(void);
 /* A game (re)starts: what was batched and not drawn is dropped. Texture slots stay. */

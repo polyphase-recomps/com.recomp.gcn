@@ -108,6 +108,7 @@ struct FrameBuffer
 {
     std::vector<uint8_t> px;
     int w = 0, h = 0, scale = 1;
+    int lw = 0, lh = 0; // the picture's size in the console's pixels
 };
 FrameBuffer sFrames[3];
 int sFrameWrite = 0, sFrameReady = -1, sFrameRead = -1;
@@ -347,6 +348,7 @@ uint32_t gcnp_retrace(void)
         fb.w = w;
         fb.h = h;
         fb.scale = gcn_gpu_frame_scale();
+        gcn_gpu_frame_logical(&fb.lw, &fb.lh);
         sFrameCopies = copies;
         std::lock_guard<std::mutex> guard(sLock);
         sFrameReady = sFrameWrite;
@@ -1266,7 +1268,8 @@ bool GcnGuestHost::GetRumble(int port)
     return port >= 0 && port < 4 && sRumble[port];
 }
 
-bool GcnGuestHost::GetFrame(uint32_t& lastSerial, const uint8_t*& rgba, int& width, int& height, int* scale)
+bool GcnGuestHost::GetFrame(uint32_t& lastSerial, const uint8_t*& rgba, int& width, int& height, int* scale,
+                            int* logicalW, int* logicalH)
 {
     std::lock_guard<std::mutex> guard(sLock);
 
@@ -1284,6 +1287,11 @@ bool GcnGuestHost::GetFrame(uint32_t& lastSerial, const uint8_t*& rgba, int& wid
     if (scale != nullptr)
     {
         *scale = fb.scale;
+    }
+    if (logicalW != nullptr && logicalH != nullptr)
+    {
+        *logicalW = fb.lw > 0 ? fb.lw : fb.w / (fb.scale > 0 ? fb.scale : 1);
+        *logicalH = fb.lh > 0 ? fb.lh : fb.h / (fb.scale > 0 ? fb.scale : 1);
     }
     return true;
 }

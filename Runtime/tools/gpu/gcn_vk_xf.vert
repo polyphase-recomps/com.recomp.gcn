@@ -25,8 +25,8 @@ struct Xf
     vec4 proj[2];     // XF 0x1020-0x1025
     vec4 vp[2];       // sx, sy, sz, ox | oy, oz, 2 * scale / frame buffer width, 2 * scale / height
     vec4 chan[4];     // channel 0 material, ambient; channel 1 material, ambient (0..255)
-    uvec4 chanf;      // channel 0 flags, lights, channel 1 flags, lights
-    vec4 light[64];   // per channel, per light: (color, a0), (position, a1), (direction, a2), (k0, k1, k2, -)
+    uvec4 chanf;      // channel 0 color, alpha, channel 1 color, alpha: flags | light mask << 8
+    vec4 light[32];   // the 8 lights: color RGBA, (position, a0), (direction, a1), (k0, k1, k2, a2)
     float mtx[272];   // XF memory 0x000-0x10F: position and texture matrices
     float nrm[104];   // 0x400-0x467: normal matrices
     float pmx[272];   // 0x500-0x60F: post (dual texture) matrices
@@ -50,40 +50,64 @@ vec3 mul34p(int a, vec4 p) { return vec3(dot(row_p(a), p), dot(row_p(a + 4), p),
 
 uint bits(uint v, int lo, int n) { return (v >> uint(lo)) & ((1u << uint(n)) - 1u); }
 
-vec4 light_channel(int ch, bool has, vec4 vcol, vec3 wpos, vec3 wnrm)
+// a light's weight at a vertex: the diffuse term times the attenuation (gcn_raster.c light_weight)
+float light_weight(uint f, int i, vec3 wpos, vec3 wnrm)
 {
-    uint f = xs[X].chanf[ch * 2];
-    int nl = int(xs[X].chanf[ch * 2 + 1]);
-    bool mat_vtx = (f & 1u) != 0u, amb_vtx = (f & 2u) != 0u, alpha_vtx = (f & 4u) != 0u, lit = (f & 8u) != 0u;
     int diffuse = int((f >> 4) & 3u);
     bool atten = (f & 64u) != 0u, spot = (f & 128u) != 0u;
-    vec4 m = xs[X].chan[ch * 2];
+    vec4 l1 = xs[X].light[i * 4 + 1], l2 = xs[X].light[i * 4 + 2], l3 = xs[X].light[i * 4 + 3];
+    vec3 d = l1.xyz - wpos;
+    float len = sqrt(dot(d, d)), att = 1.0;
+    if (len > 0.0) d *= 1.0 / len;
+    float ndl = dot(d, wnrm);
+    if (atten)
+    {
+        float cs, aa, dd;
+        if (spot)
+        {
+            // the angle to the spot's axis (its direction is stored negated), the distance
+            cs = max(dot(d, l2.xyz), 0.0);
+            aa = l1.w + l2.w * cs + l3.w * cs * cs;
+            dd = l3.x + l3.y * len + l3.z * len * len;
+        }
+        else
+        {
+            // specular: the normal against the half-angle vector, both polynomials in it
+            cs = ndl >= 0.0 ? max(dot(wnrm, l2.xyz), 0.0) : 0.0;
+            aa = l1.w + l2.w * cs + l3.w * cs * cs;
+            dd = l3.x + l3.y * cs + l3.z * cs * cs;
+        }
+        att = dd != 0.0 ? max(aa, 0.0) / dd : 0.0;
+    }
+    if (diffuse == 0) ndl = 1.0;
+    else if (diffuse == 2 && ndl < 0.0) ndl = 0.0;
+    return ndl * att;
+}
+
+vec4 light_channel(int ch, bool has, vec4 vcol, vec3 wpos, vec3 wnrm)
+{
+    uint fc = xs[X].chanf[ch * 2], fa = xs[X].chanf[ch * 2 + 1];
+    vec4 m = xs[X].chan[ch * 2], amb = xs[X].chan[ch * 2 + 1];
     vec4 col255 = vcol * 255.0;
 
-    if (mat_vtx) m.rgb = has ? col255.rgb : vec3(255.0);
-    if (alpha_vtx) m.a = has ? col255.a : 255.0;
-    if (!lit) return m;
-    vec3 acc = (amb_vtx && has) ? col255.rgb : xs[X].chan[ch * 2 + 1].rgb;
-    for (int i = 0; i < nl; i++)
+    if ((fc & 1u) != 0u) m.rgb = has ? col255.rgb : vec3(255.0);
+    if ((fa & 1u) != 0u) m.a = has ? col255.a : 255.0;
+    vec4 o = m;
+    if ((fc & 8u) != 0u)
     {
-        int b = (ch * 8 + i) * 4;
-        vec4 l0 = xs[X].light[b], l1 = xs[X].light[b + 1], l2 = xs[X].light[b + 2], l3 = xs[X].light[b + 3];
-        vec3 d = l1.xyz - wpos;
-        float len = sqrt(dot(d, d)), ndl, att = 1.0;
-        if (len > 0.0) d *= 1.0 / len;
-        ndl = dot(d, wnrm);
-        if (diffuse == 0) ndl = 1.0;
-        else if (diffuse == 2 && ndl < 0.0) ndl = 0.0;
-        if (atten)
-        {
-            float cosx = -dot(d, l2.xyz);
-            float aa = spot ? l0.w + l1.w * cosx + l2.w * cosx * cosx : 1.0;
-            float dd = l3.x + l3.y * len + l3.z * len * len;
-            att = dd != 0.0 ? max(aa, 0.0) / dd : 0.0;
-        }
-        acc += l0.rgb * ndl * att;
+        vec3 acc = ((fc & 2u) != 0u && has) ? col255.rgb : amb.rgb;
+        for (int i = 0; i < 8; i++)
+            if ((fc & (256u << uint(i))) != 0u) acc += xs[X].light[i * 4].rgb * light_weight(fc, i, wpos, wnrm);
+        o.rgb = m.rgb * clamp(acc, 0.0, 255.0) * (1.0 / 255.0);
     }
-    return vec4(m.rgb * clamp(acc, 0.0, 255.0) * (1.0 / 255.0), m.a);
+    if ((fa & 8u) != 0u)
+    {
+        float acc = ((fa & 2u) != 0u && has) ? col255.a : amb.a;
+        for (int i = 0; i < 8; i++)
+            if ((fa & (256u << uint(i))) != 0u) acc += xs[X].light[i * 4].a * light_weight(fa, i, wpos, wnrm);
+        o.a = m.a * clamp(acc, 0.0, 255.0) * (1.0 / 255.0);
+    }
+    return o;
 }
 
 void main()

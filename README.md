@@ -37,6 +37,29 @@ decomp C ──clang (big-endian ARM front end: PowerPC EABI layout)──▶ LL
 * **Threads** are coroutines (fibers / ucontext) on one game thread; interrupts are
   delivered at scheduling points.
 
+## Rendering and display settings
+
+On Windows and Linux the picture is drawn by the host's GPU (`Source/Gcn/gcn_vk.c`, Vulkan 1.2:
+the TEV as one shader, vertex transform on the GPU), else by the software rasteriser. The mod
+settings' Display group drives it (`GcnPlayer`, from `com.recomp.mod.base`'s display settings):
+
+| Setting | What |
+|---|---|
+| Resolution | the frame buffer at 1-4x the console's 640x528 (copies into textures are averaged back down) |
+| Anti-aliasing | SMAA 1x on the picture the game copies to the display |
+| Upscaler | FSR 1 (EASU): that picture upscaled to its size on screen, from the Resolution above |
+| Sharpness | FSR 1 RCAS (low, medium, high), with or without the upscaler |
+| Textures | trilinear or anisotropic 2x-16x for the world's textures (mipmapped by the game, or linear-filtered power-of-two ones of 8x8 and up; mipmaps made on the GPU from the full-size texture); nearest-filtered textures and copies of the frame buffer keep the game's sampling |
+
+The post-processing runs as compute passes on the display copy only (`gcn_vk_present`), so
+copies into textures (reflections, menus drawn from the frame buffer) are unaffected. Shaders:
+`Runtime/tools/gpu/*.vert|frag|comp`, compiled into `Source/Gcn/gcn_vk_spv.h` (and SMAA's lookup
+textures into `gcn_vk_post_tex.h`) by `gen_spv.py` (needs the Vulkan SDK's glslc).
+Third-party code (MIT, licences alongside): `Runtime/tools/gpu/third_party/fsr1` (AMD FidelityFX
+Super Resolution 1) and `third_party/smaa` (SMAA, Jimenez et al.).
+Runner: `GCN_GPU=1`, `GCN_RENDER_SCALE=n`, `GCN_SMAA=1`, `GCN_FSR=<w>x<h>`, `GCN_SHARPNESS=n`,
+`GCN_TEXTURES=n` (0-5).
+
 ## Layout
 
 | Path | What |

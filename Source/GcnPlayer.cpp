@@ -476,11 +476,19 @@ void GcnPlayer::EnsureDisplayQuad()
     mBoundQuad = ResolveWeakPtr<Quad>(mDisplayQuad);
 }
 
-void GcnPlayer::UpdateDisplayTexture(const uint8_t* pixels, int width, int height, int scale)
+void GcnPlayer::UpdateDisplayTexture(const uint8_t* pixels, int width, int height, int scale, int logicalW, int logicalH)
 {
     if (width <= 0 || height <= 0)
     {
         return;
+    }
+    if (scale < 1) scale = 1;
+    // the game's own size (the fit modes and window presets go by it, not the render resolution
+    // nor an upscaled picture's size)
+    if (logicalW <= 0 || logicalH <= 0)
+    {
+        logicalW = width / scale;
+        logicalH = height / scale;
     }
     EnsureDisplayQuad();
     Texture* texture = mFrameTexture.Get<Texture>();
@@ -504,17 +512,25 @@ void GcnPlayer::UpdateDisplayTexture(const uint8_t* pixels, int width, int heigh
             // Stretch (the old property) fills the screen; a Quad the user bound keeps its layout
             quad->SetObjectFit(mStretch ? ObjectFit::Fill : ObjectFit::Contain);
         }
-        else if (Recomp_DisplayApply(quad, texture, width / scale, height / scale, 4.0f / 3.0f, true))
+        else if (Recomp_DisplayApply(quad, texture, logicalW, logicalH, 4.0f / 3.0f, true))
         {
             // the resolution scaler (mod settings "Screen"): the console's 4:3 picture, also
             // for 640x448 copies; a changed filter needs a new texture
             mFrameTexture = nullptr;
         }
+#if !PLATFORM_DOLPHIN && !PLATFORM_3DS && !PLATFORM_ANDROID
+        {
+            // the picture's size on screen, in pixels: what the Upscaler (FSR) draws it at
+            glm::vec2 sc = quad->GetAbsoluteScale();
+            if (sc.x <= 0.0f) sc.x = 1.0f;
+            if (sc.y <= 0.0f) sc.y = 1.0f;
+            gcn_gpu_set_output_size(int(quad->GetWidth() * sc.x + 0.5f), int(quad->GetHeight() * sc.y + 0.5f));
+        }
+#endif
     }
     texture->UpdatePixels(pixels, size_t(width) * size_t(height) * 4);
-    // the game's own size (the fit modes and window presets go by it, not the render resolution)
-    GcnProvider::Get().SetFrame(width / scale, height / scale);
-    Recomp_DisplayApplyWindow(width / scale, height / scale);
+    GcnProvider::Get().SetFrame(logicalW, logicalH);
+    Recomp_DisplayApplyWindow(logicalW, logicalH);
 }
 
 void GcnPlayer::ShowStatus(const std::vector<std::string>& lines)
@@ -687,6 +703,15 @@ void GcnPlayer::Tick(float deltaTime)
         }
     }
 #endif
+#if defined(RECOMP_DISPLAY_HAS_RENDER_FEATURES) && !PLATFORM_DOLPHIN && !PLATFORM_3DS && !PLATFORM_ANDROID
+    // "Anti-aliasing", "Upscaler", "Sharpness", "Textures": the host GPU's post-processing and
+    // filtering (gcn_vk.c), from the game's next picture / primitives
+    {
+        const RecompDisplaySettings& d = Recomp_DisplaySettings();
+        gcn_gpu_set_post(d.antialias == 1, d.upscaler == 1, d.sharpness);
+        gcn_gpu_set_texture_filter(d.textures);
+    }
+#endif
     if (!mRunning)
     {
         return;
@@ -765,10 +790,10 @@ void GcnPlayer::Tick(float deltaTime)
 #endif
 
     const uint8_t* rgba = nullptr;
-    int width = 0, height = 0, scale = 1;
-    if (GcnGuestHost::GetFrame(mLastSerial, rgba, width, height, &scale))
+    int width = 0, height = 0, scale = 1, logicalW = 0, logicalH = 0;
+    if (GcnGuestHost::GetFrame(mLastSerial, rgba, width, height, &scale, &logicalW, &logicalH))
     {
-        UpdateDisplayTexture(rgba, width, height, scale);
+        UpdateDisplayTexture(rgba, width, height, scale, logicalW, logicalH);
     }
     PumpAudio();
 }

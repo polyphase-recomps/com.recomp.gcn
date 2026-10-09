@@ -1,0 +1,23 @@
+#version 450
+// FSR 1 EASU: the picture (in0, size.xy) upscaled to size.zw.
+#include "gcn_post.glsl"
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) { return textureGather(in0, p, 0); }
+AF4 FsrEasuGF(AF2 p) { return textureGather(in0, p, 1); }
+AF4 FsrEasuBF(AF2 p) { return textureGather(in0, p, 2); }
+#include "ffx_fsr1.h"
+
+void main()
+{
+    AU2 p = AU2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.size.z || p.y >= pc.size.w) return;
+    AU4 c0, c1, c2, c3;
+    FsrEasuCon(c0, c1, c2, c3, AF1(pc.size.x), AF1(pc.size.y), AF1(pc.size.x), AF1(pc.size.y), AF1(pc.size.z),
+               AF1(pc.size.w));
+    AF3 c;
+    FsrEasuF(c, p, c0, c1, c2, c3);
+    imageStore(outImg, ivec2(p), vec4(c, 1.0));
+}
